@@ -160,6 +160,9 @@ DEFAULT_CFG = {
     "show_captions": True,            # 게임 위 화면 아래쪽에 자막 창
     "caption_preview": "auto",        # 말하는 중에 먼저 뜨는 미리보기 자막 (auto = 그래픽카드로 받아쓸 때만)
     "save_transcript": False,         # 받아쓴 해설을 transcripts 폴더에 .txt로 저장
+    # 팀 팬 수: Claude API 키가 있으면 Claude Haiku에게 물어봄 (없거나 실패하면 내장 표). 팀별로 30일 동안 기억.
+    "fans_from_claude": True,
+    "fans_cache": {},
 }
 
 
@@ -220,6 +223,7 @@ class Side:
         self.key = key
         self.name = ""
         self.fans: float | None = None
+        self.fans_manual = False           # 팀 직접 정하기에서 팬 수를 넣었으면 AI가 바꾸지 않음
         self.color = "#FF4B44" if key == "home" else "#2F6BFF"
 
     @property
@@ -970,6 +974,8 @@ CHATS_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "required": ["text", "side"]}}
 # Claude 모델 (메뉴 → AI 설정에서 고름). 채팅은 빨라야 해서 Haiku가 기본.
 CLAUDE_MODELS = ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+FANS_MODEL = "claude-haiku-4-5"           # 팀 팬 수 물어보는 모델
+FANS_TTL = 30 * 86400                     # 한 번 물어본 팀은 30일 동안 다시 안 물어봄
 CLAUDE_KEY_ERR = re.compile(r"(401|403|authentication|api[_ -]?key|permission|credit balance|billing)", re.I)
 CLAUDE_PRICES = {"claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-5": (2.0, 10.0), "claude-opus-5": (5.0, 25.0)}  # 백만 토큰당 $
 
@@ -1003,9 +1009,12 @@ class LocalAI:
         self._checked = 0.0
         self._claude = None
 
+    def claude_key(self) -> str:
+        return str(self.cfg.get("claude_api_key") or "").strip()
+
     @property
     def use_claude(self) -> bool:
-        return self.cfg.get("ai_provider") == "claude" and bool(str(self.cfg.get("claude_api_key") or "").strip())
+        return self.cfg.get("ai_provider") == "claude" and bool(self.claude_key())
 
     def claude_cost(self) -> float:
         """이번 실행 Claude 비용 추정 (달러, 백만 토큰당 입력/출력 가격)"""
@@ -1132,15 +1141,15 @@ class LocalAI:
                 text = go(payload)
         return json.loads(text[text.find("{"): text.rfind("}") + 1])
 
-    def _claude_chat(self, prompt, schema, num_predict, timeout, on_text):
+    def _claude_chat(self, prompt, schema, num_predict, timeout, on_text, model=None):
         """Claude API. 답은 JSON 스키마(structured outputs)로 받고, on_text가 있으면 스트리밍으로 한 줄씩 넘김."""
         import anthropic
-        key = str(self.cfg.get("claude_api_key") or "").strip()
+        key = self.claude_key()
         if self._claude is None or key != self._claude_key:
             self._claude = anthropic.Anthropic(api_key=key, max_retries=1)
             self._claude_key = key
         system, user = prompt.split(LIVE_MARK, 1) if LIVE_MARK in prompt else ("", prompt)
-        kw = dict(model=self.model, max_tokens=max(2048, num_predict * 2),
+        kw = dict(model=model or self.model, max_tokens=max(2048, num_predict * 2),
                   messages=[{"role": "user", "content": user}],
                   output_config={"format": {"type": "json_schema", "schema": strict_schema(schema)}})
         if system:
@@ -1161,6 +1170,31 @@ class LocalAI:
         if resp.stop_reason == "refusal":
             raise RuntimeError("Claude가 답하지 않음 (refusal)")
         return json.loads(text[text.find("{"): text.rfind("}") + 1])
+
+    def ask_fans(self, teams: list[dict]) -> dict:
+        """축구팀 팬 수(백만 명, 공식 SNS 팔로워 합계)를 Claude Haiku에게 물어봄 → {팀 이름: 백만 명}.
+        채팅 AI를 Ollama로 쓰더라도 API 키가 있으면 이것만은 Claude Haiku로."""
+        import anthropic  # noqa: F401  (없으면 ImportError → 내장 표 그대로)
+        listing = "\n".join(f"- {t['name']}" + (f" ({t['en']})" if t.get("en") else "") for t in teams)
+        prompt = ("아래 축구팀들의 팬 규모를 추정해. 기준은 구단 공식 SNS(인스타그램, X, 페이스북, 틱톡, 유튜브 등) "
+                  "팔로워 수를 모두 더한 값이고, 단위는 백만 명이야 (예: 레알 마드리드는 약 450).\n"
+                  f"{listing}\n\n"
+                  "- name은 위 목록의 한국어 이름 그대로.\n"
+                  "- fans_million은 숫자 하나 (모르는 팀이면 리그·규모가 비슷한 팀을 보고 어림).")
+        schema = {"type": "object", "properties": {"teams": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "fans_million": {"type": "number"}}, "required": ["name", "fans_million"]}}},
+            "required": ["teams"]}
+        res = self._claude_chat(prompt, schema, 300, 30, None, model=FANS_MODEL)
+        wanted = {t["name"] for t in teams}
+        out = {}
+        for r in res.get("teams", []):
+            try:
+                n, f = str(r.get("name", "")).strip(), float(r.get("fans_million"))
+            except (TypeError, ValueError):
+                continue
+            if n in wanted and 0.01 <= f <= 2000:
+                out[n] = round(f, 1)
+        return out
 
     def chats(self, prompt: str, on_text=None) -> dict:
         schema = {"type": "object", "properties": {"chats": CHATS_SCHEMA}, "required": ["chats"]}
@@ -1358,6 +1392,8 @@ class AIWorker(threading.Thread):
         kind = job["type"]
         if kind == "identify":
             self.bus.put(("teams_ai", self.ai.identify(job["image"])))
+        elif kind == "fans":
+            self.bus.put(("fans", self.ai.ask_fans(job["teams"])))
         elif kind == "review":
             self.bus.put(("ai_review", {"job": job, "res": self.ai.review(job["prompt"])}))
         elif kind == "arrange":
@@ -3296,6 +3332,7 @@ class TeamDialog:
             self.app.set_team(key, n, fans=f, manual=True)
         self.app.teams_locked = True
         self.app.on_split_changed()
+        self.app.request_fans()
         self.t.destroy()
 
 
@@ -3516,6 +3553,10 @@ class App:
         t = lookup_team(name) if name else None
         side.name = t["ko"] if t else (name or "")
         side.fans = fans if (fans and fans > 0) else (t["fans"] if t else None)
+        side.fans_manual = bool(manual and fans and fans > 0)
+        cached = self.cfg.get("fans_cache", {}).get(side.name) if side.name else None
+        if not side.fans_manual and cached and time.time() - cached.get("t", 0) < FANS_TTL:
+            side.fans = cached["fans"]
         if color and re.fullmatch(r"#[0-9a-fA-F]{6}", color):
             side.color = color
 
@@ -3528,7 +3569,40 @@ class App:
             data, self.pending_screen = self.pending_screen, None
             self.on_lineup_screen(data)
         self.request_idle_pool()
+        self.request_fans()
         log.info("teams: %s vs %s", self.match.home.label, self.match.away.label)
+
+    # ----- 팀 팬 수: Claude Haiku에게 물어봄 -----
+    def request_fans(self):
+        """팬 수를 직접 넣지 않았고 최근에 물어본 적 없는 팀만 Claude Haiku에게 (API 키가 있을 때)"""
+        if not self.cfg.get("fans_from_claude", True) or not self.ai.claude_key():
+            return
+        cache = self.cfg.get("fans_cache", {})
+        todo = []
+        for key in ("home", "away"):
+            side = self.match.side(key)
+            c = cache.get(side.name)
+            if side.name and not side.fans_manual and not (c and time.time() - c.get("t", 0) < FANS_TTL):
+                t = lookup_team(side.name)
+                todo.append({"name": side.name, "en": t["en"] if t else ""})
+        if todo:
+            self.aiw.submit(0, {"type": "fans", "teams": todo})
+
+    def on_fans(self, data):
+        cache = self.cfg.setdefault("fans_cache", {})
+        changed = False
+        for name, fans in data.items():
+            cache[name] = {"fans": fans, "t": time.time()}
+            for key in ("home", "away"):
+                side = self.match.side(key)
+                if side.name == name and not side.fans_manual:
+                    if abs((side.fans or 0) - fans) > 0.05 * max(fans, 1.0):
+                        changed = True
+                    side.fans = fans
+        log.info("fans from claude haiku: %s", ", ".join(f"{n} {f:.1f}M" for n, f in data.items()))
+        save_cfg(self.cfg)
+        if changed:
+            self.on_split_changed()
 
     def on_split_changed(self):
         self.cfg["neutral_pct"] = self.auto_neutral()
@@ -3691,6 +3765,8 @@ class App:
                 self.teams_changed()
         elif kind == "ai_chats":
             self.on_ai_chats(data)
+        elif kind == "fans":
+            self.on_fans(data)
         elif kind == "hud":
             self.on_hud(data)
         elif kind == "squad_screen":

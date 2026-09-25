@@ -58,6 +58,9 @@ AI가 꺼져 있으면 해설에는 반응하지 않고 평소 잡담만 나옵�
 - 시청자끼리 대화: 최근 채팅이 쌓이면 가끔 서로 @닉네임으로 불러 맞장구·반박 (AI가 켜져 있을 때)
 - 시청자 수: 경기가 진행될수록 늘고, 골 때 확 늘고, 하프타임엔 빠졌다 돌아오고, 끝나면 서서히 나감
 - 중립 팬 비율: 두 팀 인기에 맞춰
+- 팀 팬 수: Claude API 키를 넣어 두면 팀이 정해질 때 Claude Haiku에게 물어봄 (공식 SNS 팔로워 합계 기준).
+  채팅 AI를 Ollama로 써도 키만 있으면 이것은 Haiku로 묻고, 팀마다 30일 동안 기억해서 다시 묻지 않음.
+  키가 없거나 실패하면 내장 표를 쓰고, '팀 직접 정하기'에서 팬 수를 넣으면 그 값이 우선.
 - 채팅 글자 크기: 채팅 창 폭에 맞춰 (창을 넓히면 커짐)
 - 선발 명단 크기·배치: 모니터 해상도에 맞춰, 명단을 넣은 팀만 표시
 - 초록 배경(OBS 크로마 키): OBS가 켜져 있으면 자동으로
@@ -83,6 +86,7 @@ AI가 꺼져 있으면 해설에는 반응하지 않고 평소 잡담만 나옵�
 - ai_provider: ollama(이 PC) 또는 claude. claude_api_key, claude_model(기본 claude-haiku-4-5)
   Claude를 쓰면 요청마다 요금이 나옵니다 (메뉴 → AI 설정에서 이번 실행 사용량과 대략의 비용 확인).
   API 키는 이 설정 파일에만 저장됩니다. 파일을 다른 사람에게 보내지 마세요.
+- fans_from_claude: false면 팬 수를 Claude에게 묻지 않고 내장 표만 씀. fans_cache: Claude가 답한 팬 수 기록
 - chat_mode / chat_intensity: 채팅 분위기와 세기 (메뉴에서 바꿀 수 있음)
 - streamer_name: 입력칸에 쓴 내 채팅이 뜨는 이름
 - show_captions / caption_preview(auto·on·off) / save_transcript: 해설 자막 설정
