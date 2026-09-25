@@ -21,6 +21,12 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
+where nvidia-smi >nul 2>nul
+if not errorlevel 1 (
+  echo NVIDIA 그래픽카드를 찾았습니다. 받아쓰기를 그래픽카드로 돌리는 데 필요한 파일을 설치합니다...
+  python -m pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+)
+echo.
 echo [2/4] 이 PC용 AI(Ollama) 확인 중...
 set "OLLAMA=%LOCALAPPDATA%\Programs\Ollama\ollama.exe"
 where ollama >nul 2>nul && set "OLLAMA=ollama"

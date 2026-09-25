@@ -123,7 +123,8 @@ DEFAULT_CFG = {
     "ai_interval_sec": 20,
     "self_review": True,              # 채팅 기록을 AI에게 보내 어색한 문장·닉네임을 스스로 고치기
     "review_interval_sec": 120,
-    "whisper_model": "auto",          # auto / tiny / base / small / medium
+    "whisper_model": "auto",          # auto / tiny / base / small / medium / large-v3-turbo
+    "whisper_device": "auto",         # auto = 그래픽카드가 되면 그래픽카드, cpu = 항상 CPU
     "language": "ko",                 # ko = 한국어 해설, en = 영어 해설
     "neutral_pct": 33,
     "speed": "normal",
@@ -1059,6 +1060,27 @@ def to_16k(a, rate: int):
     return np.interp(np.linspace(0, len(a), n, endpoint=False), np.arange(len(a)), a).astype(np.float32)
 
 
+CUDA_ERR = re.compile(r"(cublas|cudnn|cuda|cudart|nvrtc|curand)", re.I)
+
+
+def add_cuda_dll_dirs():
+    """pip로 설치한 NVIDIA 라이브러리(nvidia-cublas-cu12 등)를 윈도우가 찾을 수 있게 경로에 넣음"""
+    if not IS_WIN:
+        return
+    import site
+    roots = list(site.getsitepackages()) + [site.getusersitepackages()]
+    for root in roots:
+        base = Path(root) / "nvidia"
+        if not base.is_dir():
+            continue
+        for b in base.glob("*/bin"):
+            try:
+                os.add_dll_directory(str(b))
+            except Exception:
+                pass
+            os.environ["PATH"] = str(b) + os.pathsep + os.environ.get("PATH", "")
+
+
 class AudioSTT(threading.Thread):
     """게임 소리에서 해설자 말소리만 골라(VAD) 문장 단위로 끊어서 받아씀.
     예전처럼 5초씩 자르면 단어가 중간에 잘려 인식이 망가지므로, 말이 멈춘 곳에서 자름."""
@@ -1079,34 +1101,44 @@ class AudioSTT(threading.Thread):
         self.no_hotwords = False
 
     @classmethod
-    def load_model(cls, cfg):
-        if cls._model is not None:
+    def load_model(cls, cfg, force_cpu: bool = False):
+        if cls._model is not None and not force_cpu:
             return cls._model
+        add_cuda_dll_dirs()
+        import numpy as np
         from faster_whisper import WhisperModel
         size = cfg.get("whisper_model", "auto")
-        device, compute = "cpu", "int8"
-        try:
-            import ctranslate2
-            if ctranslate2.get_cuda_device_count() > 0:
-                device, compute = "cuda", "int8_float16"   # 게임과 그래픽 메모리를 나눠 쓰니 가볍게
-        except Exception:
-            pass
-        if size == "auto":
-            # 한국어는 작은 모델에서 틀리는 게 많아서 가능한 한 큰 모델부터 시도
-            cands = ["large-v3-turbo", "small"] if device == "cuda" else ["small", "base"]
-        else:
-            cands = [size]
+        use_cuda = False
+        if not force_cpu and cfg.get("whisper_device", "auto") != "cpu":
+            try:
+                import ctranslate2
+                use_cuda = ctranslate2.get_cuda_device_count() > 0
+            except Exception:
+                pass
         threads = min(4, max(2, (os.cpu_count() or 4) // 3))
         err = None
-        for s in cands:
-            try:
-                log.info("loading whisper %s on %s", s, device)
-                cls._model = WhisperModel(s, device=device, compute_type=compute, cpu_threads=threads)
-                cls._size, cls._device = s, device
-                return cls._model
-            except Exception as e:
-                log.warning("whisper %s failed: %s", s, e)
-                err = e
+        for device in (["cuda", "cpu"] if use_cuda else ["cpu"]):
+            compute = "int8_float16" if device == "cuda" else "int8"   # 게임과 그래픽 메모리를 나눠 쓰니 가볍게
+            if size == "auto":
+                # 한국어는 작은 모델에서 틀리는 게 많아서 가능한 한 큰 모델부터 시도
+                cands = ["large-v3-turbo", "small"] if device == "cuda" else ["small", "base"]
+            else:
+                cands = [size]
+            for s in cands:
+                try:
+                    log.info("loading whisper %s on %s", s, device)
+                    model = WhisperModel(s, device=device, compute_type=compute, cpu_threads=threads)
+                    if device == "cuda":
+                        # 그래픽카드 라이브러리(cuBLAS·cuDNN)는 실제로 돌릴 때 불러오므로 한 번 시험해 봄
+                        segs, _ = model.transcribe(np.zeros(SR, dtype=np.float32), language="ko", beam_size=1)
+                        list(segs)
+                    cls._model, cls._size, cls._device = model, s, device
+                    return model
+                except Exception as e:
+                    log.warning("whisper %s on %s failed: %s", s, device, e)
+                    err = e
+                    if device == "cuda" and CUDA_ERR.search(str(e)):
+                        break          # 그래픽카드 라이브러리가 없으면 다른 크기도 안 되니 바로 CPU로
         raise err or RuntimeError("no whisper model")
 
     def _cb(self, in_data, frame_count, time_info, status):
@@ -1126,8 +1158,9 @@ class AudioSTT(threading.Thread):
             log.warning("vad unavailable, fixed chunks: %s", e)
             return None
 
-    def transcribe(self, model, piece, vad_done: bool):
+    def transcribe(self, piece, vad_done: bool):
         import numpy as np
+        model = self.model
         peak = float(np.max(np.abs(piece))) if len(piece) else 0.0
         if peak < 0.003:
             return
@@ -1142,13 +1175,23 @@ class AudioSTT(threading.Thread):
         if hot and not self.no_hotwords:
             kw["hotwords"] = hot
         try:
-            segs, _ = model.transcribe(piece, **kw)
-            segs = list(segs)
-        except TypeError:                       # 오래된 faster-whisper에는 hotwords가 없음
-            self.no_hotwords = True
-            kw.pop("hotwords", None)
-            segs, _ = model.transcribe(piece, **kw)
-            segs = list(segs)
+            try:
+                segs, _ = model.transcribe(piece, **kw)
+                segs = list(segs)
+            except TypeError:                   # 오래된 faster-whisper에는 hotwords가 없음
+                self.no_hotwords = True
+                kw.pop("hotwords", None)
+                segs, _ = model.transcribe(piece, **kw)
+                segs = list(segs)
+        except Exception as e:
+            if self._device == "cuda" and CUDA_ERR.search(str(e)):
+                # 그래픽카드로 못 돌리면 CPU로 바꿔서 계속
+                log.warning("cuda transcribe failed, switching to cpu: %s", e)
+                self.bus.put(("stt_status", ("loading", "그래픽카드를 쓸 수 없어 CPU로 바꾸는 중…")))
+                self.model = self.load_model(self.cfg, force_cpu=True)
+                self.bus.put(("stt_status", ("on", "해설 듣는 중 (CPU)")))
+                return
+            raise
         parts = []
         for s in segs:
             if s.avg_logprob < -1.1:
@@ -1173,7 +1216,7 @@ class AudioSTT(threading.Thread):
             return
         try:
             self.bus.put(("stt_status", ("loading", "받아쓰기 모델 불러오는 중…")))
-            model = self.load_model(self.cfg)
+            self.model = self.load_model(self.cfg)
         except Exception as e:
             log.exception("whisper load failed")
             self.bus.put(("stt_status", ("error", f"받아쓰기 모델을 불러오지 못했습니다: {e}")))
@@ -1213,7 +1256,7 @@ class AudioSTT(threading.Thread):
                 if vad is None:                             # VAD가 없으면 예전처럼 5초씩
                     if len(buf) >= 5 * SR:
                         piece, buf = buf[:5 * SR], buf[5 * SR:]
-                        self.transcribe(model, piece, vad_done=False)
+                        self.transcribe(piece, vad_done=False)
                     continue
                 if len(buf) < int(0.8 * SR) or time.time() - last_check < 0.35:
                     continue
@@ -1242,7 +1285,7 @@ class AudioSTT(threading.Thread):
                     continue
                 piece, buf = buf[start:cut], buf[cut:]
                 if len(piece) >= int(0.4 * SR):
-                    self.transcribe(model, piece, vad_done=True)
+                    self.transcribe(piece, vad_done=True)
         except Exception as e:
             log.exception("audio loop failed")
             self.bus.put(("stt_status", ("error", f"게임 소리를 가져오지 못했습니다: {e}")))
