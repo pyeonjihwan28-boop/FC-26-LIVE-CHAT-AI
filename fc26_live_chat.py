@@ -102,6 +102,8 @@ TEAMS = [
     dict(ko="헐 시티", en="Hull City", codes=["HUL"], alias=["헐 시티", "헐시티", "hull"], fans=None),
 ]
 DEFAULT_FANS = 10.0  # 백만 명, 팬 수를 모를 때
+# 화면에 보이는 시청자 수 배율 (0.1 = 예전의 10분의 1). 채팅 속도·후원 빈도는 예전 시청자 수 기준 그대로.
+VIEWER_SCALE = 0.1
 
 # 선발 명단 머리에 쓰는 짧은 이름
 SHORT = {
@@ -269,7 +271,7 @@ class Match:
         return {"home": h0 + sh, "away": a0 + sa, "neutral": n0 - sh - sa}
 
     def viewer_floor(self) -> int:
-        return int(round((self.home.fans_or_default + self.away.fans_or_default) * 1e6 * 1.5 / 1000))
+        return int(round((self.home.fans_or_default + self.away.fans_or_default) * 1e6 * 1.5 / 1000 * VIEWER_SCALE))
 
     def lineup(self, key) -> dict | None:
         lu = self.cfg.get("lineups", {}).get(self.side(key).label)
@@ -3597,7 +3599,7 @@ class App:
 
     def chat_rate(self) -> float:
         """1초에 나오는 채팅 수. 시청자 1천 명 ≈ 0.3개, 3만 명 ≈ 1개, 30만 명 ≈ 2.2개, 100만 명 ≈ 3.3개."""
-        base = 0.3 * (max(200, self.viewers) / 1000) ** 0.35
+        base = 0.3 * (max(200, self.viewers / VIEWER_SCALE) / 1000) ** 0.35
         mult = SPEED_MULT.get(self.cfg.get("speed", "normal"), 1.0)
         # 경기 흐름: 하프타임·경기 뒤엔 뜸하고, 후반 막판엔 빨라짐
         if self.phase == "half":
@@ -3619,7 +3621,7 @@ class App:
 
     def next_idle(self) -> dict:
         # 가끔 후원·새 멤버 (시청자가 많을수록 조금 더 자주)
-        p = min(0.02, 0.003 * (max(1000, self.viewers) / 100000) ** 0.5)
+        p = min(0.02, 0.003 * (max(1000, self.viewers / VIEWER_SCALE) / 100000) ** 0.5)
         r = random.random()
         if r < p:
             return self.engine.random_super()
