@@ -1574,6 +1574,64 @@ def parse_squad_pitch(items: list[tuple[float, float, str]], height: float) -> d
     return {"formation": "-".join(str(len(r)) for r in rows[1:]), "rows": ordered}
 
 
+# 경기 전 '예상 라인업' 화면 (상대 팀): 왼쪽 경기장에 포메이션 모양으로 선수 이름, 아래 '교체' 줄,
+# 오른쪽에 리그·엠블럼·ATT/MID/DEF 능력치. 한글은 글자 읽기(OCR)가 못 읽어서 ATT/MID/DEF로 이 화면인지 알아봄.
+PREVIEW_PANEL = (0.66, 0.60, 0.32, 0.10)     # ATT MID DEF 글자
+PREVIEW_PITCH = (0.04, 0.13, 0.56, 0.50)     # 포메이션 제목(4-4-2 플랫) + 선발 11명
+PREVIEW_BENCH = (0.04, 0.70, 0.56, 0.10)     # 교체 선수 이름 줄
+FORM_RX = re.compile(r"(?<!\d)(\d)\s*-\s*(\d)\s*-\s*(\d)(?:\s*-\s*(\d))?(?:\s*-\s*(\d))?(?!\d)")
+
+
+def clean_shown_name(t: str) -> str:
+    """화면 이름 다듬기: 주장 C·눈(스카우트) 아이콘처럼 한 글자로 읽힌 조각은 버림 ('C A. Pedraza' → 'A. Pedraza')"""
+    toks = [x for x in str(t or "").split() if not (len(x) == 1 and x.isalpha())]
+    t = re.sub(rf"[^{NAME_CH}.\-' ]", "", " ".join(toks)).strip(" -")
+    # 글자 읽기가 띄어쓰기를 빼먹은 것 되살리기: PauNavarro → Pau Navarro, A.Pedraza → A. Pedraza (McTominay, C.V.는 그대로)
+    t = re.sub(r"([a-zß-ÿ])(?=[A-ZÀ-Þ])", lambda mm: mm.group(1) if re.search(r"\bMa?c$", t[:mm.end()]) else mm.group(1) + " ", t)
+    t = re.sub(r"\.(?=[A-ZÀ-Þ][a-zß-ÿ])", ". ", t)
+    return t if len(re.sub(rf"[^{NAME_CH}]", "", t)) >= 3 else ""
+
+
+def parse_preview(pitch: list[tuple[float, float, str]], bench: list[tuple[float, float, str]]) -> dict | None:
+    """예상 라인업 화면의 글자 (y, x, 글자) → {"formation": "4-4-2", "rows": [[골키퍼], [수비 왼→오], …], "bench": [...]}.
+    포메이션 제목이 읽히면 그 숫자대로 아래(골키퍼)부터 줄을 나눔 — 원근 때문에 측면 선수가 조금 위에 있어도 맞게."""
+    form = None
+    names = []
+    for y, x, t in pitch:
+        fm = FORM_RX.search(t)
+        if fm:
+            form = [int(g) for g in fm.groups() if g]
+            continue
+        n = clean_shown_name(t)
+        if n:
+            names.append((y, x, n))
+    if len(names) != 11:
+        return None
+    names.sort(key=lambda n: -n[0])                  # 아래(골키퍼)부터
+    if form and sum(form) == 10 and 3 <= len(form) <= 5:
+        rows, i = [[names[0]]], 1
+        for k in form:
+            rows.append(names[i:i + k])
+            i += k
+        # 줄끼리 세로로 겹치면 잘못 나눈 것 (다른 화면이거나 이름을 덜 읽음)
+        if any(min(n[0] for n in lower) <= max(n[0] for n in upper) for lower, upper in zip(rows, rows[1:])):
+            return None
+    else:
+        span = max(n[0] for n in names) - min(n[0] for n in names)
+        rows = [[names[0]]]
+        for n in names[1:]:
+            if rows[-1][-1][0] - n[0] > span * 0.08:
+                rows.append([n])
+            else:
+                rows[-1].append(n)
+        if len(rows[0]) != 1 or not (3 <= len(rows) - 1 <= 5) or any(len(r) > 5 for r in rows[1:]):
+            return None
+        form = [len(r) for r in rows[1:]]
+    ordered = [[t for _, _, t in sorted(r, key=lambda n: n[1])] for r in rows]
+    subs = [clean_shown_name(t) for _, _, t in sorted(bench, key=lambda b: b[1])]
+    return {"formation": "-".join(map(str, form)), "rows": ordered, "bench": [s for s in subs if s][:12]}
+
+
 def ocr_lines(items: list[tuple[float, float, str]], row_tol: float) -> list[str]:
     """OCR 조각 (y, x, 글자) → 줄 단위 글"""
     rows: list[list] = []
@@ -1624,6 +1682,36 @@ class BoardWatcher(threading.Thread):
         self.last_lineup_check = 0.0
         self.last_lineup_sig = None
         self.last_squad_sig = None
+        self.last_preview_sig = None
+
+    @staticmethod
+    def ocr_region(sct, mon, ocr, np, region) -> list[tuple[float, float, str]]:
+        """화면 한 부분의 글자 → [(y, x, 글자)]. 작은 화면(1280×720 등)은 2배로 키워서 읽음."""
+        l, t, w, h = region
+        reg = {"left": int(mon["left"] + l * mon["width"]), "top": int(mon["top"] + t * mon["height"]),
+               "width": max(40, int(w * mon["width"])), "height": max(20, int(h * mon["height"]))}
+        shot = np.array(sct.grab(reg))[:, :, :3]            # BGR
+        if mon["width"] < 1700:
+            shot = shot.repeat(2, axis=0).repeat(2, axis=1)
+        result, _ = ocr(shot.copy())
+        return [(sum(p[1] for p in box) / 4, sum(p[0] for p in box) / 4, txt) for box, txt, _s in (result or [])]
+
+    def read_preview_screen(self, sct, mon, ocr, np) -> bool:
+        """경기 전 '예상 라인업'(상대 팀) 화면이면 포메이션·선발·교체 명단을 보냄. 이 화면이면 True."""
+        labels = {t.strip().upper() for _, _, t in self.ocr_region(sct, mon, ocr, np, PREVIEW_PANEL)}
+        if len(labels & {"ATT", "MID", "DEF"}) < 2:
+            return False
+        parsed = parse_preview(self.ocr_region(sct, mon, ocr, np, PREVIEW_PITCH),
+                               self.ocr_region(sct, mon, ocr, np, PREVIEW_BENCH))
+        if not parsed:
+            log.info("preview screen seen but lineup not readable")
+            return True
+        sig = (parsed["formation"], tuple(n for r in parsed["rows"] for n in r), tuple(parsed["bench"]))
+        if sig != self.last_preview_sig:
+            self.last_preview_sig = sig
+            log.info("preview screen (opponent): %s %s bench=%s", parsed["formation"], parsed["rows"], parsed["bench"])
+            self.bus.put(("preview_screen", {**parsed, "t": time.time()}))
+        return True
 
     def read_hud(self, sct, mon, ocr, np):
         """화면 아래 글자를 읽어 보냄 → App이 명단과 맞춰 '지금 조작 중인 선수'와 '골 넣은 선수'를 찾음"""
@@ -1724,10 +1812,11 @@ class BoardWatcher(threading.Thread):
                         if parsed:
                             self.bus.put(("board", parsed))
                         self.board_miss = 0 if (parsed and "codes" in parsed) else self.board_miss + 1
-                        # 스코어보드가 안 보이면(일시정지·메뉴) 선발 라인업 화면인지 4초마다 확인
+                        # 스코어보드가 안 보이면(일시정지·메뉴) 4초마다: 예상 라인업(상대 팀) → 선발 라인업 → 팀 관리 화면인지 확인
                         if self.board_miss >= 2 and time.time() - self.last_lineup_check > 4:
                             self.last_lineup_check = time.time()
-                            self.read_lineup_screen(sct, mon, ocr, np, Image)
+                            if not self.read_preview_screen(sct, mon, ocr, np):
+                                self.read_lineup_screen(sct, mon, ocr, np, Image)
                 except StopIteration:
                     pass
                 except Exception:
@@ -3059,6 +3148,7 @@ class App:
         self.alias_counts: dict[str, int] = {}
         self.pending_screen: dict | None = None      # 팀을 알기 전에 읽은 선발 라인업 화면
         self.pending_squad: dict | None = None       # 명단을 알기 전에 읽은 팀 관리 화면 (포메이션)
+        self.pending_preview: dict | None = None     # 어느 팀인지 알기 전에 읽은 예상 라인업 화면 (상대 팀)
         self.place_chat_window()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.after(100, self.poll)
@@ -3221,6 +3311,7 @@ class App:
         if self.pending_screen:
             data, self.pending_screen = self.pending_screen, None
             self.on_lineup_screen(data)
+        self.retry_preview()
         log.info("teams: %s vs %s", self.match.home.label, self.match.away.label)
 
     def on_split_changed(self):
@@ -3377,6 +3468,8 @@ class App:
             self.on_squad_screen(data)
         elif kind == "lineup_screen":
             self.on_lineup_screen(data)
+        elif kind == "preview_screen":
+            self.on_preview_screen(data)
         elif kind == "obs":
             if data != self.obs_on:
                 self.obs_on = data
@@ -3531,6 +3624,7 @@ class App:
                 self.apply_screen_lineup(key, rows)
         if self.pending_squad:
             self.on_squad_screen(self.pending_squad)
+        self.retry_preview()
         self.refresh_overlay()
 
     def apply_screen_lineup(self, key, rows: list[tuple[str, str]]):
@@ -3566,6 +3660,18 @@ class App:
                 people.append({"no": no, "name": q["name"], "en": en} if q and same_name(q.get("en") or q["name"], en) or
                               (q and q["name"] == en) else {"no": no, "name": en, "en": en})
             form = old.get("formation") or "4-3-3"
+            # 예상 라인업 화면에서 읽은 자리(등번호 없음)가 있으면 자리는 그대로 두고 등번호·영어 이름만 채움
+            if old.get("formation_from_screen") and old.get("players") and not any(q.get("no") for q in old["players"]):
+                def same(a, b):
+                    return any(w in plain(b) for w in re.split(r"[\s.\-']+", plain(a)) if len(w) >= 3)
+                filled = []
+                for q in old["players"]:
+                    hit = next(((no, en) for no, en in rows if same(q.get("en") or q["name"], en)), None)
+                    filled.append({**q, "no": hit[0], "en": hit[1]} if hit else q)
+                if sum(1 for q in filled if q.get("no")) >= 9:
+                    lineups[side.label] = {**old, "players": filled, "screen_order": order}
+                    save_cfg(self.cfg)
+                    return
             if old.get("formation_from_screen") and sorted(order) == sorted(q.get("no") for q in old.get("players", [])):
                 # 같은 선수들 — 팀 관리 화면에서 읽은 포메이션·자리 그대로
                 lineups[side.label] = {**old, "screen_order": order}
@@ -3609,6 +3715,69 @@ class App:
         self.user_side_votes[key] += 5
         save_cfg(self.cfg)
         log.info("formation from squad screen: %s %s", self.match.side(key).label, data["formation"])
+        self.refresh_overlay()
+        self.retry_preview()
+
+    # ----- 상대 팀 명단: 경기 전 '예상 라인업' 화면에서 읽기 -----
+    def on_preview_screen(self, data):
+        """예상 라인업 화면 = 상대 팀. 포메이션·자리·교체 명단을 화면에 나온 그대로 씀.
+        어느 팀인지 아직 모르면(경기 전엔 스코어보드가 없어 팀을 모름) 기억해 뒀다가 알게 되면 붙임."""
+        self.pending_preview = data
+        self.retry_preview()
+
+    def retry_preview(self):
+        data = self.pending_preview
+        if not data or not self.teams_known:
+            return
+        if time.time() - data.get("t", 0) > 20 * 60:        # 한참 전 화면은 다른 경기일 수 있음
+            self.pending_preview = None
+            return
+        key = self.preview_side(data)
+        if key is None:
+            return
+        self.pending_preview = None
+        self.apply_preview(key, data)
+
+    def preview_side(self, data) -> str | None:
+        """예상 라인업이 어느 팀인지: 이미 아는 명단과 이름이 맞는 팀 → 내 팀(조작하는 팀)의 반대 → 명단을 아는 팀의 반대"""
+        m = self.match
+        shown = [n for r in data["rows"] for n in r]
+        score = {k: sum(1 for n in shown if self.person_for(k, n)) for k in ("home", "away")}
+        best = max(score, key=score.get)
+        if score[best] >= 6:
+            return best
+        v = self.user_side_votes
+        mine = max(v, key=v.get)
+        if v[mine] >= 3 and v[mine] > v[m.other(mine)]:
+            return m.other(mine)
+        # 한 팀 명단만 알고(보통 지난 경기에 저장된 내 팀) 그 명단과 거의 안 맞으면 → 다른 팀
+        known = [k for k in ("home", "away") if len(m.lineup_names(k)) >= 9]
+        if len(known) == 1 and score[known[0]] <= 2:
+            return m.other(known[0])
+        return None
+
+    def apply_preview(self, key, data):
+        m = self.match
+        side = m.side(key)
+        lineups = self.cfg.setdefault("lineups", {})
+        old = lineups.get(side.label) or {}
+        used: set[str] = set()
+
+        def person(shown: str) -> dict:
+            q = self.person_for(key, shown) if old else None
+            if q and q["name"] not in used:
+                used.add(q["name"])
+                return dict(q)                      # 전에 쓰던 이름·등번호 그대로
+            return {"no": "", "name": shown, "en": shown}
+
+        players = [person(n) for r in data["rows"] for n in r]
+        bench = [person(n) for n in data.get("bench", [])]
+        lineups[side.label] = {**old, "formation": data["formation"], "players": players, "bench": bench,
+                               "color": old.get("color", side.color), "formation_from_screen": True}
+        self.user_side_votes[m.other(key)] += 3       # 상대 팀 명단이니 다른 쪽이 내 팀
+        save_cfg(self.cfg)
+        log.info("opponent lineup from preview screen: %s %s %s | bench %s", side.label, data["formation"],
+                 ", ".join(p["name"] for p in players), ", ".join(b["name"] for b in bench))
         self.refresh_overlay()
 
     def mark_card(self, key, name, what):
@@ -3762,6 +3931,8 @@ class App:
             hit = self.match_hud(line)
             if hit:
                 self.hud_hist = [h for h in self.hud_hist if now - h[0] < 60] + [(now, hit[0], hit[1])]
+                if self.pending_preview:              # 내 팀을 알게 되면 기다리던 상대 명단을 붙임
+                    self.retry_preview()
                 break
         # 골 뒤 화면 아래에 득점자 이름이 뜨면 (상대 팀 골도) 그걸로
         bg = self.last_board_goal
