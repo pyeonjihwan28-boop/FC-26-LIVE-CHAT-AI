@@ -4,7 +4,7 @@
 FC 26 라이브 채팅
 - FC 26이 켜지면 자동으로 채팅 창(유튜브 라이브 채팅 스타일)과 선발 명단 오버레이를 띄웁니다.
 - 게임 소리(해설)를 이 PC 안에서 받아쓰고(faster-whisper), 스코어보드를 읽고(RapidOCR),
-  이 PC에서 돌아가는 AI(Ollama)로 채팅을 만듭니다. 원하면 Claude API로 바꿀 수 있습니다 (메뉴 → AI 설정).
+  이 PC에서 돌아가는 AI(Ollama)로 채팅을 만듭니다. 외부 API는 쓰지 않습니다.
 - 받아쓴 해설은 게임 위 자막 창으로도 띄웁니다 (말하는 중에도 먼저 뜨는 미리보기 자막, 파일 저장).
 - 채팅 분위기(모드)·세기, 방장 채팅 입력, 시청자끼리 @부르기, 채팅 캡처 저장.
 - AI나 받아쓰기가 없으면 내장 문장으로 대신 반응합니다.
@@ -148,10 +148,6 @@ DEFAULT_CFG = {
     "scoreboard_region": [0.0, 0.0, 0.5, 0.2],   # 화면 비율 (왼쪽, 위, 폭, 높이)
     "korean_players": KOREAN_DEFAULT,
     "lineups": {},
-    # AI: ollama = 이 PC (무료), claude = Claude API (유료, 채팅이 더 자연스러움. 화면 보고 팀 찾기는 계속 Ollama)
-    "ai_provider": "ollama",
-    "claude_api_key": "",
-    "claude_model": "claude-haiku-4-5",
     # 채팅 분위기 (CHAT_MODES) · 세기 0~10
     "chat_mode": "default",
     "chat_intensity": 5,
@@ -160,8 +156,8 @@ DEFAULT_CFG = {
     "show_captions": True,            # 게임 위 화면 아래쪽에 자막 창
     "caption_preview": "auto",        # 말하는 중에 먼저 뜨는 미리보기 자막 (auto = 그래픽카드로 받아쓸 때만)
     "save_transcript": False,         # 받아쓴 해설을 transcripts 폴더에 .txt로 저장
-    # 팀 팬 수: Claude API 키가 있으면 Claude Haiku에게 물어봄 (없거나 실패하면 내장 표). 팀별로 30일 동안 기억.
-    "fans_from_claude": True,
+    # 팀 팬 수: 이 PC의 AI(Ollama)에게 물어봄 (AI가 없거나 실패하면 내장 표). 팀별로 30일 동안 기억.
+    "fans_from_ai": True,
     "fans_cache": {},
 }
 
@@ -972,24 +968,7 @@ LIVE_MARK = "\n<<<LIVE>>>\n"
 CHATS_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "text": {"type": "string"}, "side": {"type": "string", "enum": ["home", "away", "neutral"]}},
     "required": ["text", "side"]}}
-# Claude 모델 (메뉴 → AI 설정에서 고름). 채팅은 빨라야 해서 Haiku가 기본.
-CLAUDE_MODELS = ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
-FANS_MODEL = "claude-haiku-4-5"           # 팀 팬 수 물어보는 모델
 FANS_TTL = 30 * 86400                     # 한 번 물어본 팀은 30일 동안 다시 안 물어봄
-CLAUDE_KEY_ERR = re.compile(r"(401|403|authentication|api[_ -]?key|permission|credit balance|billing)", re.I)
-CLAUDE_PRICES = {"claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-5": (2.0, 10.0), "claude-opus-5": (5.0, 25.0)}  # 백만 토큰당 $
-
-
-def strict_schema(s):
-    """Claude structured outputs는 모든 object에 additionalProperties: false가 있어야 함"""
-    if isinstance(s, dict):
-        out = {k: strict_schema(v) for k, v in s.items()}
-        if out.get("type") == "object":
-            out["additionalProperties"] = False
-        return out
-    if isinstance(s, list):
-        return [strict_schema(v) for v in s]
-    return s
 
 
 class LocalAI:
@@ -1000,26 +979,6 @@ class LocalAI:
         self._ok = False
         self._checked = 0.0
         self._lock = threading.Lock()
-        self._claude = None                 # anthropic.Anthropic (Claude를 고르면 처음 쓸 때 만듦)
-        self._claude_key = ""
-        self.usage = {"in": 0, "out": 0}    # 이번 실행에서 Claude가 쓴 토큰
-
-    def reset(self):
-        """AI 설정을 바꾼 뒤: 다음 요청 때 다시 확인"""
-        self._checked = 0.0
-        self._claude = None
-
-    def claude_key(self) -> str:
-        return str(self.cfg.get("claude_api_key") or "").strip()
-
-    @property
-    def use_claude(self) -> bool:
-        return self.cfg.get("ai_provider") == "claude" and bool(self.claude_key())
-
-    def claude_cost(self) -> float:
-        """이번 실행 Claude 비용 추정 (달러, 백만 토큰당 입력/출력 가격)"""
-        price = CLAUDE_PRICES.get(self.cfg.get("claude_model") or "", (1.0, 5.0))
-        return self.usage["in"] / 1e6 * price[0] + self.usage["out"] / 1e6 * price[1]
 
     CHAT_MODELS = ["exaone3.5:7.8b", "gemma3:12b", "qwen2.5:7b", "exaone3.5:2.4b", "gemma3:4b"]
     VISION_MODELS = ["gemma3:4b", "gemma3:12b", "llava:7b"]
@@ -1036,8 +995,6 @@ class LocalAI:
 
     @property
     def model(self):
-        if self.use_claude:
-            return self.cfg.get("claude_model") or CLAUDE_MODELS[0]
         return self._chosen or self.cfg.get("ollama_model") or "exaone3.5:7.8b"
 
     def _req(self, path, payload=None, timeout=10):
@@ -1083,25 +1040,12 @@ class LocalAI:
             self._ok = bool(chosen)
         except Exception:
             self._ok = False
-        if self.use_claude:
-            # 채팅은 Claude로 (Ollama가 없어도 됨). 화면 보고 팀 찾기만 Ollama가 있으면 씀.
-            try:
-                import anthropic  # noqa: F401
-                self._ok = True
-            except ImportError:
-                log.warning("Claude를 골랐지만 anthropic 패키지가 없음 (install.bat을 다시 실행) → Ollama로")
         return self._ok
 
-    def _chat(self, prompt, schema, images=None, num_predict=900, timeout=90, on_text=None, model=None):
+    def _chat(self, prompt, schema, images=None, num_predict=900, timeout=90, on_text=None, model=None, temperature=0.95):
         """on_text가 있으면 AI가 글자를 만드는 대로 받아서(스트리밍) 지금까지의 글을 on_text(글)로 넘김.
         그래서 채팅 10개를 다 만들 때까지 기다리지 않고 한 줄씩 바로 띄울 수 있음.
         prompt 안의 LIVE_MARK 앞부분은 system으로 — 매번 똑같아서 Ollama가 앞부분 계산을 재사용함 (첫 반응이 빨라짐)."""
-        if self.use_claude and not images:
-            try:
-                import anthropic  # noqa: F401
-                return self._claude_chat(prompt, schema, num_predict, timeout, on_text)
-            except ImportError:
-                pass
         msgs = []
         if LIVE_MARK in prompt:
             system, prompt = prompt.split(LIVE_MARK, 1)
@@ -1111,7 +1055,7 @@ class LocalAI:
             msg["images"] = images
         msgs.append(msg)
         payload = {"model": model or self.model, "messages": msgs, "stream": on_text is not None, "keep_alive": "30m",
-                   "format": schema, "options": {"temperature": 0.95, "top_p": 0.95, "repeat_penalty": 1.15, "num_predict": num_predict}}
+                   "format": schema, "options": {"temperature": temperature, "top_p": 0.95, "repeat_penalty": 1.15, "num_predict": num_predict}}
 
         def go(pl):
             if on_text is None:
@@ -1141,40 +1085,8 @@ class LocalAI:
                 text = go(payload)
         return json.loads(text[text.find("{"): text.rfind("}") + 1])
 
-    def _claude_chat(self, prompt, schema, num_predict, timeout, on_text, model=None):
-        """Claude API. 답은 JSON 스키마(structured outputs)로 받고, on_text가 있으면 스트리밍으로 한 줄씩 넘김."""
-        import anthropic
-        key = self.claude_key()
-        if self._claude is None or key != self._claude_key:
-            self._claude = anthropic.Anthropic(api_key=key, max_retries=1)
-            self._claude_key = key
-        system, user = prompt.split(LIVE_MARK, 1) if LIVE_MARK in prompt else ("", prompt)
-        kw = dict(model=model or self.model, max_tokens=max(2048, num_predict * 2),
-                  messages=[{"role": "user", "content": user}],
-                  output_config={"format": {"type": "json_schema", "schema": strict_schema(schema)}})
-        if system:
-            kw["system"] = system
-        client = self._claude.with_options(timeout=float(timeout))
-        if on_text is None:
-            resp = client.messages.create(**kw)
-            text = "".join(b.text for b in resp.content if b.type == "text")
-        else:
-            text = ""
-            with client.messages.stream(**kw) as st:
-                for piece in st.text_stream:
-                    text += piece
-                    on_text(text)
-                resp = st.get_final_message()
-        self.usage["in"] += resp.usage.input_tokens
-        self.usage["out"] += resp.usage.output_tokens
-        if resp.stop_reason == "refusal":
-            raise RuntimeError("Claude가 답하지 않음 (refusal)")
-        return json.loads(text[text.find("{"): text.rfind("}") + 1])
-
     def ask_fans(self, teams: list[dict]) -> dict:
-        """축구팀 팬 수(백만 명, 공식 SNS 팔로워 합계)를 Claude Haiku에게 물어봄 → {팀 이름: 백만 명}.
-        채팅 AI를 Ollama로 쓰더라도 API 키가 있으면 이것만은 Claude Haiku로."""
-        import anthropic  # noqa: F401  (없으면 ImportError → 내장 표 그대로)
+        """축구팀 팬 수(백만 명, 공식 SNS 팔로워 합계)를 이 PC의 AI에게 물어봄 → {팀 이름: 백만 명}"""
         listing = "\n".join(f"- {t['name']}" + (f" ({t['en']})" if t.get("en") else "") for t in teams)
         prompt = ("아래 축구팀들의 팬 규모를 추정해. 기준은 구단 공식 SNS(인스타그램, X, 페이스북, 틱톡, 유튜브 등) "
                   "팔로워 수를 모두 더한 값이고, 단위는 백만 명이야 (예: 레알 마드리드는 약 450).\n"
@@ -1184,7 +1096,7 @@ class LocalAI:
         schema = {"type": "object", "properties": {"teams": {"type": "array", "items": {"type": "object", "properties": {
             "name": {"type": "string"}, "fans_million": {"type": "number"}}, "required": ["name", "fans_million"]}}},
             "required": ["teams"]}
-        res = self._claude_chat(prompt, schema, 300, 30, None, model=FANS_MODEL)
+        res = self._chat(prompt, schema, num_predict=200, timeout=60, temperature=0.2)
         wanted = {t["name"] for t in teams}
         out = {}
         for r in res.get("teams", []):
@@ -1374,7 +1286,6 @@ class AIWorker(threading.Thread):
                 self.do(job)
             except Exception as e:
                 log.warning("ai job failed: %s", e)
-                job["error"] = str(e)
                 self.bus.put(("ai_failed", job))
             finally:
                 self.busy = False
@@ -2652,7 +2563,7 @@ class ChatWindow:
                                value=n, variable=self.v_int, command=lambda: toggle("chat_intensity", self.v_int, self.app.on_mode_changed))
         mm.add_cascade(label="분위기 세기", menu=mi)
         m.add_cascade(label="채팅 분위기", menu=mm)
-        m.add_command(label="AI 설정 (Ollama / Claude)…", command=self.app.open_ai_dialog)
+        m.add_command(label="내 채팅 이름…", command=self.app.open_name_dialog)
         m.add_command(label="채팅 캡처 저장 (최근 12줄)", command=self.app.save_clip)
         m.add_separator()
         # 해설 자막 (realtime-captions-system-audio)
@@ -3250,51 +3161,27 @@ class LineupEditor:
         self.top.destroy()
 
 
-class AIDialog:
-    """AI 고르기: 이 PC(Ollama, 무료) 또는 Claude API(유료, 채팅이 더 자연스러움)"""
+class NameDialog:
+    """입력창에 쓴 내 채팅이 뜨는 이름"""
 
     def __init__(self, app):
         self.app = app
-        cfg = app.cfg
         t = tk.Toplevel(app.root)
-        t.title("AI 설정")
+        t.title("내 채팅 이름")
         t.attributes("-topmost", True)
         t.configure(padx=14, pady=12)
         self.t = t
-        self.provider = tk.StringVar(value=cfg.get("ai_provider", "ollama"))
-        ttk.Radiobutton(t, text="이 PC의 AI (Ollama) — 무료", value="ollama", variable=self.provider).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Radiobutton(t, text="Claude API — 유료, 채팅이 더 자연스러움", value="claude", variable=self.provider).grid(row=1, column=0, columnspan=2, sticky="w")
-        tk.Label(t, text="Claude API 키").grid(row=2, column=0, sticky="w", pady=(8, 2))
-        self.key = ttk.Entry(t, width=44, show="•")
-        self.key.grid(row=2, column=1, sticky="w", pady=(8, 2))
-        self.key.insert(0, cfg.get("claude_api_key", ""))
-        tk.Label(t, text="Claude 모델").grid(row=3, column=0, sticky="w", pady=2)
-        self.model = ttk.Combobox(t, values=CLAUDE_MODELS, width=24)
-        self.model.grid(row=3, column=1, sticky="w", pady=2)
-        self.model.set(cfg.get("claude_model") or CLAUDE_MODELS[0])
-        tk.Label(t, text="내 채팅 이름").grid(row=4, column=0, sticky="w", pady=2)
+        tk.Label(t, text="입력칸에 쓴 내 채팅이 이 이름(노란색)으로 뜹니다.").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.name = ttk.Entry(t, width=20)
-        self.name.grid(row=4, column=1, sticky="w", pady=2)
-        self.name.insert(0, cfg.get("streamer_name") or "방장")
-        ai = app.ai
-        used = (f"이번 실행 Claude 사용량: 입력 {ai.usage['in']:,} / 출력 {ai.usage['out']:,} 토큰 (약 ${ai.claude_cost():.3f})"
-                if ai.usage["in"] else "API 키는 console.anthropic.com 에서 만들 수 있습니다. 키는 이 PC의 설정 파일에만 저장됩니다.")
-        tk.Label(t, text=used + "\n화면을 보고 팀을 찾는 기능은 Claude를 골라도 Ollama(gemma3)가 있으면 그대로 씁니다.",
-                 fg="#666666", justify="left", wraplength=460).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Button(t, text="저장", command=self.apply).grid(row=6, column=1, sticky="e", pady=(10, 0))
+        self.name.grid(row=1, column=0, sticky="w")
+        self.name.insert(0, app.cfg.get("streamer_name") or "방장")
+        self.name.bind("<Return>", lambda e: self.apply())
+        ttk.Button(t, text="저장", command=self.apply).grid(row=1, column=1, sticky="e", padx=(8, 0))
 
     def apply(self):
-        cfg = self.app.cfg
-        cfg["ai_provider"] = self.provider.get()
-        cfg["claude_api_key"] = self.key.get().strip()
-        cfg["claude_model"] = self.model.get().strip() or CLAUDE_MODELS[0]
-        cfg["streamer_name"] = re.sub(r"\s+", " ", self.name.get()).strip()[:20] or "방장"
-        save_cfg(cfg)
-        self.app.ai.reset()
+        self.app.cfg["streamer_name"] = re.sub(r"\s+", " ", self.name.get()).strip()[:20] or "방장"
+        save_cfg(self.app.cfg)
         self.app.chat.build_composer()
-        log.info("ai provider: %s (%s)", cfg["ai_provider"], cfg["claude_model"] if cfg["ai_provider"] == "claude" else cfg.get("ollama_model"))
-        if cfg["ai_provider"] == "claude" and not cfg["claude_api_key"]:
-            messagebox.showwarning("AI 설정", "Claude API 키가 없어서 이 PC의 AI(Ollama)를 계속 씁니다.", parent=self.t)
         self.t.destroy()
 
 
@@ -3332,6 +3219,7 @@ class TeamDialog:
             self.app.set_team(key, n, fans=f, manual=True)
         self.app.teams_locked = True
         self.app.on_split_changed()
+        self.app.last_fans_req = 0.0
         self.app.request_fans()
         self.t.destroy()
 
@@ -3398,6 +3286,7 @@ class App:
         self.pending_screen: dict | None = None      # 팀을 알기 전에 읽은 선발 라인업 화면
         self.pending_squad: dict | None = None       # 명단을 알기 전에 읽은 팀 관리 화면 (포메이션)
         self.idle_pool: list[dict] = []
+        self.last_fans_req = 0.0
         self.place_chat_window()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.after(100, self.poll)
@@ -3569,13 +3458,14 @@ class App:
             data, self.pending_screen = self.pending_screen, None
             self.on_lineup_screen(data)
         self.request_idle_pool()
+        self.last_fans_req = 0.0
         self.request_fans()
         log.info("teams: %s vs %s", self.match.home.label, self.match.away.label)
 
-    # ----- 팀 팬 수: Claude Haiku에게 물어봄 -----
+    # ----- 팀 팬 수: 이 PC의 AI(Ollama)에게 물어봄 -----
     def request_fans(self):
-        """팬 수를 직접 넣지 않았고 최근에 물어본 적 없는 팀만 Claude Haiku에게 (API 키가 있을 때)"""
-        if not self.cfg.get("fans_from_claude", True) or not self.ai.claude_key():
+        """팬 수를 직접 넣지 않았고 최근에 물어본 적 없는 팀만 AI에게"""
+        if not self.cfg.get("fans_from_ai", True) or time.time() - self.last_fans_req < 60 or not self.ai_ready():
             return
         cache = self.cfg.get("fans_cache", {})
         todo = []
@@ -3586,6 +3476,7 @@ class App:
                 t = lookup_team(side.name)
                 todo.append({"name": side.name, "en": t["en"] if t else ""})
         if todo:
+            self.last_fans_req = time.time()
             self.aiw.submit(0, {"type": "fans", "teams": todo})
 
     def on_fans(self, data):
@@ -3599,7 +3490,7 @@ class App:
                     if abs((side.fans or 0) - fans) > 0.05 * max(fans, 1.0):
                         changed = True
                     side.fans = fans
-        log.info("fans from claude haiku: %s", ", ".join(f"{n} {f:.1f}M" for n, f in data.items()))
+        log.info("fans from ai: %s", ", ".join(f"{n} {f:.1f}M" for n, f in data.items()))
         save_cfg(self.cfg)
         if changed:
             self.on_split_changed()
@@ -3791,8 +3682,6 @@ class App:
                 self.chat.apply_theme()
         elif kind == "ai_failed":
             job = data
-            if self.ai.use_claude and CLAUDE_KEY_ERR.search(job.get("error", "")):
-                self.chat.set_state("● Claude 오류: API 키나 크레딧을 확인하세요 (메뉴 → AI 설정)")
             if job.get("fallback_ev"):
                 msgs = self.engine.burst(job["fallback_ev"], random.randint(2, 4) if job.get("host") else 8)
                 self.apply_mention(job, msgs)
@@ -4427,6 +4316,8 @@ class App:
         self.aiw.submit(1, {"type": "chat", "prompt": prompt, "idle": True})
 
     def tick_flow(self):
+        if self.session_on and self.teams_known:
+            self.request_fans()
         # 해설 반응이 한동안 없을 때(조용한 구간)만 AI가 경기 흐름 잡담을 만듦
         quiet = time.time() - self.last_react_at > 15
         if (self.session_on and self.live and quiet and time.time() - self.last_ai_flow > 18 and self.ai_ready()):
@@ -4540,8 +4431,8 @@ class App:
     def open_mark_dialog(self):
         MarkDialog(self)
 
-    def open_ai_dialog(self):
-        AIDialog(self)
+    def open_name_dialog(self):
+        NameDialog(self)
 
     def quit(self):
         try:
