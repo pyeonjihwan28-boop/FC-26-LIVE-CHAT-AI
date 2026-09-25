@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import io
 import json
 import logging
@@ -258,6 +259,18 @@ class Match:
         lu = self.cfg.get("lineups", {}).get(self.side(key).label)
         return lu if lu and any(p.get("name") for p in lu.get("players", [])) else None
 
+    def lineup_people(self, key) -> list[dict]:
+        lu = self.lineup(key) or {}
+        return [q for q in lu.get("players", []) + lu.get("bench", []) if q.get("name")]
+
+    def lineup_en(self, key) -> list[str]:
+        return [q["en"] for q in self.lineup_people(key) if q.get("en")]
+
+    def lineup_desc(self, key, n=11) -> str:
+        """AI에게 줄 명단: 야말(Lamine Yamal)"""
+        return ", ".join(q["name"] + (f"({q['en']})" if q.get("en") and q["en"] != q["name"] else "")
+                         for q in self.lineup_people(key)[:n])
+
     def lineup_names(self, key) -> list[str]:
         lu = self.lineup(key)
         if not lu:
@@ -318,12 +331,81 @@ HYPE = {"goal": 2.0, "red": 2.5, "penalty": 2.0, "end": 2.0, "kickoff": 1.0, "ha
 EV_DESC = {k: v.split(" (")[0] for k, v in EVENTS.items()}
 
 
+R_CHO = ["g", "kk", "n", "d", "tt", "l", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h"]
+R_JUNG = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"]
+R_JONG = ["", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "l", "l", "l", "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t",
+          "k", "t", "p", "t"]
+
+
+def romanize(s: str) -> str:
+    out = []
+    for ch in s:
+        c = ord(ch) - 0xAC00
+        if 0 <= c < 11172:
+            out.append(R_CHO[c // 588] + R_JUNG[(c % 588) // 28] + R_JONG[c % 28])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=8192)
+def phon(s: str) -> str:
+    """이름 발음 뼈대: 한글은 로마자로 바꾸고, 한국어 외래어 표기에서 헷갈리는 소리를 한데 모음.
+    야말 → iamal = Yamal → iamal, 레반도프스키 → lepantopski = Lewandowski → lepantopski"""
+    hangul = is_hangul(s)
+    t = romanize(s).lower()
+    if not hangul:                                   # 영어 이름을 한국어 표기처럼 읽기
+        t = re.sub(r"a([^aeiou\s])e\b", r"ei\1", t)    # Kane → kein (케인)
+        t = re.sub(r"z\b", "s", t)                      # Perez → peres (페레스)
+        t = re.sub(r"er\b", "o", t)                     # Palmer → palmo (팔머)
+        t = re.sub(r"(?<=[aeiou])h\b", "", t)          # Salah → sala (살라)
+        t = re.sub(r"r(?=[^aeiouy\s])", "", t)          # Rashford → rashfod (자음 앞 r은 소리 안 냄)
+        t = t.replace("aa", "a")
+    t = re.sub(r"[^a-z]", "", t)
+    for a, b in (("ph", "f"), ("ck", "k"), ("sch", "s"), ("sh", "s"), ("th", "t"), ("eu", ""), ("ae", "e"), ("eo", "o"),
+                 ("oo", "u"), ("ou", "u"), ("ee", "i"), ("c", "k"), ("q", "k"), ("x", "ks"), ("z", "j"), ("r", "l"),
+                 ("v", "b"), ("w", "b"), ("f", "p"), ("y", "i"), ("g", "k"), ("d", "t"), ("b", "p")):
+        t = t.replace(a, b)
+    return re.sub(r"(.)\1+", r"\1", t)
+
+
+def is_hangul(s: str) -> bool:
+    return bool(re.search(r"[가-힣]", s))
+
+
+def same_name(a: str, b: str) -> bool:
+    """글자(한글/영어)가 달라도 같은 이름인지"""
+    pa, pb = phon(a), phon(b)
+    if len(pa) < 3 or len(pb) < 3:
+        return False
+    if pa == pb:
+        return True
+    if min(len(pa), len(pb)) <= 4:          # 짧은 이름은 흔한 말과 겹치기 쉬워서 완전히 같을 때만 (팔로 ≠ Palmer)
+        return False
+    from difflib import SequenceMatcher
+    return pa[0] == pb[0] and SequenceMatcher(None, pa, pb).ratio() >= 0.82
+
+
+def _name_tokens(text: str) -> list[str]:
+    out = []
+    for tok in re.findall(r"[가-힣]+|[A-Za-z][A-Za-z'\-]+", text):
+        out.append(split_josa(tok)[0] if is_hangul(tok) else tok)
+    return out
+
+
 def names_in_text(text: str, names: list[str]) -> list[str]:
     low = text.lower()
     hits = []
+    toks = None
     for n in names:
         parts = [n] + [p for p in n.split() if len(p) >= 2]
         if any(len(p) >= 2 and p.lower() in low for p in parts):
+            hits.append(n)
+            continue
+        # 한글 ↔ 영어 (해설에 Yamal, 명단엔 야말 / 그 반대)
+        if toks is None:
+            toks = _name_tokens(text)
+        if any(is_hangul(t) != is_hangul(q) and same_name(t, q) for t in toks for q in parts):
             hits.append(n)
     return hits
 
@@ -987,13 +1069,24 @@ class LocalAI:
             "required": ["bad_chat_ids", "bad_name_ids", "new_lines", "new_names"]}
         return self._chat(prompt, schema, num_predict=1400, timeout=150)
 
+    def squad(self, prompt: str) -> dict:
+        person = {"type": "object", "properties": {"no": {"type": "string"}, "name_ko": {"type": "string"},
+                                                   "name_en": {"type": "string"}}, "required": ["no", "name_ko", "name_en"]}
+        schema = {"type": "object", "properties": {
+            "formation": {"type": "string"},
+            "players": {"type": "array", "items": person}, "bench": {"type": "array", "items": person}},
+            "required": ["formation", "players", "bench"]}
+        return self._chat(prompt, schema, num_predict=1200, timeout=120)
+
     def identify(self, jpeg_b64: str) -> dict:
         schema = {"type": "object", "properties": {
             "found": {"type": "boolean"}, "home": {"type": "string"}, "away": {"type": "string"},
+            "home_ko": {"type": "string"}, "away_ko": {"type": "string"},
             "home_color": {"type": "string"}, "away_color": {"type": "string"}},
-            "required": ["found", "home", "away", "home_color", "away_color"]}
-        prompt = ("이 이미지는 EA SPORTS FC 26 경기 화면의 스코어보드 부분이야. 엠블럼과 팀 약칭을 보고 두 팀을 알아내.\n"
-                  "- home = 스코어보드 왼쪽 팀, away = 오른쪽 팀. 이름은 영어 공식 팀 이름으로.\n"
+            "required": ["found", "home", "away", "home_ko", "away_ko", "home_color", "away_color"]}
+        prompt = ("이 이미지는 축구 경기 중계 화면의 위쪽이야. 스코어보드(팀 약칭·엠블럼·점수)와 경기장 광고판·현수막 글자를 단서로 두 팀을 알아내.\n"
+                  "- home = 스코어보드에서 먼저 나온 팀(왼쪽, 또는 위아래로 쌓였으면 위), away = 다른 팀.\n"
+                  "- home/away = 영어 공식 팀 이름, home_ko/away_ko = 한국에서 부르는 팀 이름 (예: Villarreal → 비야레알).\n"
                   "- home_color/away_color = 그 팀 대표 색 (#RRGGBB).\n"
                   "- 스코어보드가 안 보이거나 확신이 없으면 found=false.")
         return self._chat(prompt, schema, images=[jpeg_b64], num_predict=200, timeout=60)
@@ -1102,6 +1195,8 @@ class AIWorker(threading.Thread):
             self.bus.put(("teams_ai", self.ai.identify(job["image"])))
         elif kind == "review":
             self.bus.put(("ai_review", {"job": job, "res": self.ai.review(job["prompt"])}))
+        elif kind == "squad":
+            self.bus.put(("squad", {"job": job, "res": self.ai.squad(job["prompt"])}))
         elif kind == "react":
             if time.time() - job["t"] > 12:      # 한참 지난 해설은 건너뜀 (지금 해설부터)
                 return
@@ -1539,12 +1634,13 @@ class BoardWatcher(threading.Thread):
                         parsed = parse_board(items)
                         if parsed:
                             self.bus.put(("board", parsed))
-                    # 엠블럼 인식: 팀을 아직 모를 때 20초마다
-                    if self.need_ident_fn() and time.time() - self.last_ident > 20 and self.ai.available():
+                    # 팀을 아직 모르면 15초마다 화면 위쪽 전체(스코어보드·엠블럼·광고판)를 AI에게 보여 줌
+                    if self.need_ident_fn() and time.time() - self.last_ident > 15 and self.ai.available():
                         self.last_ident = time.time()
-                        crop = img.convert("RGB")
-                        if crop.width < 900:
-                            crop = crop.resize((crop.width * 2, crop.height * 2))
+                        top = {"left": mon["left"], "top": mon["top"], "width": mon["width"], "height": int(mon["height"] * 0.3)}
+                        crop = Image.fromarray(np.array(sct.grab(top))[:, :, :3][:, :, ::-1]).convert("RGB")
+                        if crop.width > 1600:
+                            crop = crop.resize((1600, int(crop.height * 1600 / crop.width)))
                         bio = io.BytesIO()
                         crop.save(bio, format="JPEG", quality=88)
                         self.aiw.submit(0, {"type": "identify", "image": base64.b64encode(bio.getvalue()).decode()})
@@ -2567,7 +2663,12 @@ class LineupEditor:
     def save(self):
         cfg = self.app.cfg
         for key, col in self.cols.items():
+            old = cfg.get("lineups", {}).get(col["label"], {})
+            old_en = {q.get("name"): q.get("en", "") for q in old.get("players", []) + old.get("bench", []) if q.get("en")}
             players = [{"no": no.get().strip(), "name": nm.get().strip()} for no, nm in col["rows"]]
+            for q in players:                      # AI가 채운 영어 이름은 이름을 안 바꿨으면 그대로
+                if q["name"] in old_en:
+                    q["en"] = old_en[q["name"]]
             bench = []
             for part in re.split(r"[,，]", col["bench"].get()):
                 part = part.strip()
@@ -2577,8 +2678,6 @@ class LineupEditor:
                 bench.append({"no": mm.group(1), "name": mm.group(2).strip()} if mm else {"no": "", "name": part})
             cfg.setdefault("lineups", {})[col["label"]] = {"formation": col["formation"].get().strip() or "4-3-3",
                                                            "players": players, "bench": bench, "color": col["color"]}
-        cfg["lineup_visible"] = True
-        self.app.chat.v_lineup.set(True)
         save_cfg(cfg)
         self.app.refresh_overlay()
         self.top.destroy()
@@ -2675,6 +2774,7 @@ class App:
         self.last_ai_flow = 0.0
         self.last_ai_comment_n = 0
         self.alias_counts: dict[str, int] = {}
+        self.squad_asked: dict[str, float] = {}     # 팀 이름 → AI에게 명단을 물어본 시각
         self.idle_pool: list[dict] = []
         self.place_chat_window()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -2833,6 +2933,7 @@ class App:
         self.match.reset_for_new_match()
         self.on_split_changed()
         self.refresh_overlay()
+        self.ensure_lineups()
         self.request_idle_pool()
         log.info("teams: %s vs %s", self.match.home.label, self.match.away.label)
 
@@ -2876,7 +2977,8 @@ class App:
         names = list(dict.fromkeys(names))
         teams = f"{m.home.label} 대 {m.away.label}" if m.home.name or m.away.name else "축구"
         prompt = f"{teams} 경기 중계입니다."
-        hot = " ".join([m.home.name, m.away.name, *names]).strip()
+        # 핫워드엔 영어 이름도 (해설자가 원어 발음으로 부르는 이름)
+        hot = " ".join([m.home.name, m.away.name, *names, *m.lineup_en("home")[:11], *m.lineup_en("away")[:11]]).strip()
         return prompt, hot
 
     # ----- 메시지 처리 -----
@@ -2985,11 +3087,16 @@ class App:
             self.on_board(data)
         elif kind == "teams_ai":
             if data.get("found") and data.get("home") and data.get("away") and not self.teams_locked:
-                self.set_team("home", data["home"], color=data.get("home_color"))
-                self.set_team("away", data["away"], color=data.get("away_color"))
+                log.info("ai teams: %s", data)
+                for key in ("home", "away"):
+                    en, ko = data.get(key, ""), data.get(key + "_ko", "")
+                    # 목록에 있는 팀이면 목록 이름으로, 없으면 AI가 준 한국어 이름으로
+                    self.set_team(key, en if lookup_team(en) else (ko or en), color=data.get(key + "_color"))
                 self.teams_changed()
         elif kind == "ai_chats":
             self.on_ai_chats(data)
+        elif kind == "squad":
+            self.on_squad(data)
         elif kind == "ai_react_head":
             self.on_ai_react_head(data)
         elif kind == "ai_react_chat":
@@ -3051,7 +3158,7 @@ class App:
             "- 해설은 음성 받아쓰기라 오타가 있을 수 있음. 앞뒤 해설 흐름을 같이 보고 판단할 것.\n"
             "- '골'이라는 말이 있어도 기회·아쉬움·골대·골키퍼 이야기면 goal이 아님. 확실할 때만 goal.\n"
             "- team: 그 장면의 주인공 팀 (골이면 넣은 팀, 파울·카드면 저지른 팀). 모르면 unknown.\n"
-            "- player: 해설에 나온 주인공 선수 이름 (명단에 있으면 명단 이름 그대로). 없으면 빈 문자열. "
+            "- player: 해설에 나온 주인공 선수 이름. 해설이 영어 이름이나 원어 발음으로 불러도 명단의 한국어 이름 그대로. 없으면 빈 문자열. "
             "교체면 player=나가는 선수, player_in=들어오는 선수.\n"
             "- 채팅 개수: none이면 0~2개, 보통 장면 2~4개, goal·penalty·red·end는 8~12개.\n\n"
             f"{RULES}\n- super(후원)는 goal·penalty·red·end일 때만 1개 이하.\n"
@@ -3078,16 +3185,63 @@ class App:
         return msgs, pool
 
     def resolve_player(self, name: str, side: str | None = None) -> tuple[str | None, str | None]:
-        """AI가 말한 선수 이름을 선발 명단의 (팀, 이름)으로"""
+        """AI가 말한 선수 이름(한글이든 영어든)을 선발 명단의 (팀, 이름)으로"""
         name = str(name or "").strip()
         if not name:
             return None, None
         for key in [k for k in (side, "home", "away") if k in ("home", "away")]:
-            names = self.match.lineup_names(key)
-            hits = names_in_text(name, names) or [n for n in names if n in name or name in n]
-            if hits:
-                return key, hits[0]
+            for q in self.match.lineup_people(key):
+                cands = [q["name"]] + ([q["en"]] if q.get("en") else [])
+                if names_in_text(name, cands) or any(c in name or name in c for c in cands):
+                    return key, q["name"]
         return None, None
+
+    # ----- 선발 명단 자동 채우기 -----
+    def ensure_lineups(self):
+        """팀은 아는데 선발 명단이 없으면 AI에게 그 팀 선수들을 물어봄 (한국어·영어 이름)"""
+        if not self.ai_ready():
+            return
+        for key in ("home", "away"):
+            side = self.match.side(key)
+            if not side.name or self.match.lineup(key) or time.time() - self.squad_asked.get(side.name, 0) < 300:
+                continue
+            self.squad_asked[side.name] = time.time()
+            t = lookup_team(side.name)
+            en = t["en"] if t else side.name
+            prompt = (f"{en} ({side.label}) 축구팀의 2025-26 시즌 주전 선발 11명과 교체 선수 7~9명을 알려 줘. 가장 최근 정보로.\n"
+                      "- formation: 이 팀이 주로 쓰는 포메이션 (예: 4-3-3, 4-2-3-1).\n"
+                      "- players: 정확히 11명. 순서는 골키퍼 → 수비 줄(왼쪽→오른쪽) → 미드필더 줄(왼쪽→오른쪽) → 공격 줄(왼쪽→오른쪽), "
+                      "포메이션 줄 수와 인원에 맞게.\n"
+                      "- no = 등번호, name_ko = 한국 중계에서 부르는 짧은 이름 (예: 야말, 레반도프스키, 페드리, 손흥민), "
+                      "name_en = 영어 이름 (예: Lamine Yamal).")
+            log.info("asking squad: %s", en)
+            self.aiw.submit(0, {"type": "squad", "team": side.label, "key": key, "prompt": prompt})
+
+    def on_squad(self, data):
+        job, res = data["job"], data["res"]
+
+        def person(q):
+            ko = re.sub(r"\s+", " ", str(q.get("name_ko") or "")).strip()[:16]
+            en = re.sub(r"\s+", " ", str(q.get("name_en") or "")).strip()[:30]
+            no = re.sub(r"\D", "", str(q.get("no") or ""))[:2]
+            return {"no": no, "name": ko or en, "en": en} if (ko or en) else None
+
+        players = [x for x in (person(q) for q in res.get("players", [])) if x][:11]
+        bench = [x for x in (person(q) for q in res.get("bench", [])) if x][:9]
+        form = str(res.get("formation", "")).strip()
+        if not re.fullmatch(r"\d(-\d){2,4}", form) or sum(int(x) for x in form.split("-")) != 10:
+            form = "4-3-3"
+        if len(players) < 11:
+            log.warning("squad for %s incomplete (%d)", job["team"], len(players))
+            return
+        side = self.match.side(job["key"])
+        if side.label != job["team"] or self.match.lineup(job["key"]):
+            return                                   # 그사이 팀이 바뀌었거나 사람이 명단을 넣음
+        self.cfg.setdefault("lineups", {})[job["team"]] = {"formation": form, "players": players, "bench": bench,
+                                                           "color": side.color, "auto": True}
+        save_cfg(self.cfg)
+        log.info("squad filled by ai: %s %s %s", job["team"], form, ", ".join(q["name"] for q in players))
+        self.refresh_overlay()
 
     def mark_card(self, key, name, what):
         m = self.match
@@ -3258,8 +3412,8 @@ class App:
         kor = "; ".join(f"{m.side(k).label}에 한국 선수({', '.join(m.korean_names(k))})가 있어 한국인 시청자 일부가 이 팀을 응원"
                         for k in ("home", "away") if m.has_korean(k))
         recent = "\n".join("- " + t for _, t in m.commentary[-8:]) or "- (아직 없음)"
-        return (f"홈 팀: {m.home.label} (선수: {', '.join(m.lineup_names('home')[:11]) or '정보 없음'})\n"
-                f"원정 팀: {m.away.label} (선수: {', '.join(m.lineup_names('away')[:11]) or '정보 없음'})\n"
+        return (f"홈 팀: {m.home.label} (선수: {m.lineup_desc('home') or '정보 없음'})\n"
+                f"원정 팀: {m.away.label} (선수: {m.lineup_desc('away') or '정보 없음'})\n"
                 f"현재 스코어: {m.score_text()}\n"
                 f"경기 시간: {str(m.minute) + '분' if m.minute is not None else '알 수 없음'}\n"
                 f"시청자 세력: {m.home.label} 팬 {sp['home']:.1f}%, {m.away.label} 팬 {sp['away']:.1f}%, 중립 {sp['neutral']:.1f}%"
@@ -3292,6 +3446,8 @@ class App:
         self.aiw.submit(1, {"type": "chat", "prompt": prompt, "idle": True})
 
     def tick_flow(self):
+        if self.session_on and self.teams_known:
+            self.ensure_lineups()
         # 해설 반응이 한동안 없을 때(조용한 구간)만 AI가 경기 흐름 잡담을 만듦
         quiet = time.time() - self.last_react_at > 15
         if (self.session_on and self.live and quiet and time.time() - self.last_ai_flow > 18 and self.ai_ready()):
