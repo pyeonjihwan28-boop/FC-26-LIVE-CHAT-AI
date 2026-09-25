@@ -6,7 +6,7 @@ FC 26 라이브 채팅
 - 게임 소리(해설)를 이 PC 안에서 받아쓰고(faster-whisper), 스코어보드를 읽고(RapidOCR),
   채팅은 AI 없이 chat_lines.py의 문장과 경기 상황으로 만듭니다 (Ollama 같은 AI는 쓰지 않음).
 - 받아쓴 해설은 게임 위 자막 창으로도 띄웁니다 (말하는 중에도 먼저 뜨는 미리보기 자막, 파일 저장).
-- 채팅 분위기(모드)·세기, 방장 채팅 입력, 시청자끼리 @부르기, 채팅 캡처 저장.
+- 채팅 분위기(모드)·세기, 시청자끼리 @부르기, 채팅 캡처 저장.
 - 받아쓰기가 없으면 스코어보드와 평소 잡담만으로 채팅합니다.
 """
 from __future__ import annotations
@@ -142,7 +142,6 @@ DEFAULT_CFG = {
     # 채팅 분위기 (CHAT_MODES) · 세기 0~10
     "chat_mode": "default",
     "chat_intensity": 5,
-    "streamer_name": "방장",          # 입력창에 내가 쓴 채팅이 뜨는 이름
     # 해설 자막
     "show_captions": True,            # 게임 위 화면 아래쪽에 자막 창
     "caption_preview": "auto",        # 말하는 중에 먼저 뜨는 미리보기 자막 (auto = 그래픽카드로 받아쓸 때만)
@@ -695,9 +694,6 @@ class Audience:
             return self.new_person(faction or "neutral")
         return random.choices(pool, weights=[v.weight for v in pool])[0]
 
-    def find(self, name: str) -> Viewer | None:
-        return next((v for v in self.people if v.name == name), None)
-
 
 class ChatEngine:
     """채팅 만들기. 장면·경기 상황에 맞는 문장을 고르고, 사람마다 말버릇을 입히고, 서로 대답하게 함."""
@@ -755,7 +751,7 @@ class ChatEngine:
              "score": f"{m.hs}:{m.as_}", "hs": str(m.hs), "as": str(m.as_),
              "home": m.home.short if m.home.name else "", "away": m.away.short if m.away.name else "",
              "min": str(m.minute) if m.minute is not None else "", "lead": lead, "trail": trail,
-             "host": self.cfg.get("streamer_name") or "방장", "form": lu.get("formation", "") if lu.get("players") else "",
+             "form": lu.get("formation", "") if lu.get("players") else "",
              "ev": self.scene["desc"] if self.scene and time.time() - self.scene["t"] < 90 else "",
              "n": ""}
         d.update(extra)
@@ -1063,48 +1059,6 @@ class ChatEngine:
         d = self.slots(v, key, n=self.scorer or "")
         t = self.choose(CL.ANSWERS.get(kind, []), d, v)
         return self.say(v, t, "neu") if t else None
-
-    # ----- 방장(입력창) 채팅에 반응 -----
-    HOST_INTENTS = [
-        ("predict", re.compile(r"(누가\s*이길|예측|예상|몇\s*대\s*몇\s*(으로|날|될)|이길\s*(까|것)|스코어\s*예상)")),
-        ("score", re.compile(r"(몇\s*대\s*몇|스코어\s*(몇|뭐))")),
-        ("min", re.compile(r"몇\s*분")),
-        ("kor", re.compile(r"한국\s*선수")),
-        ("greet", re.compile(r"(안녕|ㅎㅇ|하이|반가|어서\s*와|hello|\bhi\b)", re.I)),
-        ("thanks", re.compile(r"(고마|감사|ㄳ|ㄱㅅ|땡큐)")),
-        ("cheer", re.compile(r"(가자|가즈아|화이팅|파이팅|이기자|ㄱㄱ|힘내)")),
-        ("sad", re.compile(r"(ㅠ|ㅜ|아쉽|졌|망했|슬프)")),
-        ("laugh", re.compile(r"^[ㅋㅎ\s!?]+$|ㅋㅋㅋ")),
-        ("chat", re.compile(r"(채팅|다들|여러분|시청자)")),
-        ("question", re.compile(r"(\?|뭐|왜|어때|어떻|누구|언제|맞지|맞아|할까|일까)")),
-    ]
-
-    def host_replies(self, text: str, mention: str | None) -> list[dict]:
-        intent = next((k for k, rx in self.HOST_INTENTS if rx.search(text)), "other")
-        out = []
-        if mention:                                          # 방장이 부른 사람이 먼저 대답
-            v = self.crowd.find(mention)
-            if v:
-                t = self.choose(CL.HOST["called"], self.slots(v, v.faction if v.faction in ("home", "away") else None), v)
-                if t:
-                    out.append(self.say(v, t, "neu"))
-        n = random.randint(3, 6)
-        used = {mention} if mention else set()
-        for _ in range(n):
-            v = self.speaker(used=used)
-            key = v.faction if v.faction in ("home", "away") else None
-            if intent in ("score", "min", "kor"):
-                a = self.answer(intent, None)
-                if a:
-                    out.append(a)
-                continue
-            pool = CL.HOST.get(intent, CL.HOST["other"])
-            if intent == "question" and random.random() < 0.3:
-                pool = CL.HOST["other"]
-            t = self.choose(pool, self.slots(v, key), v)
-            if t:
-                out.append(self.say(v, t, {"laugh": "pos", "cheer": "pos", "sad": "neg"}.get(intent, "neu")))
-        return out
 
     # ----- 후원·새 멤버 -----
     def super_chat(self, kind: str, side: str | None = None) -> dict | None:
@@ -1850,7 +1804,7 @@ def game_running() -> bool:
 # ---------------------------------------------------------------------------
 BG, BG2, LINE = "#0f0f0f", "#181818", "#303030"
 FG, FG2 = "#f1f1f1", "#aaaaaa"
-MEMBER, MOD, OWNER = "#2ba640", "#5e84f1", "#ffd600"
+MEMBER, MOD = "#2ba640", "#5e84f1"
 CHROMA = "#00b140"
 TIERS = [  # (최소 금액, 머리 색, 몸 색, 글자 색)
     (100000, "#d00000", "#e62117", "#ffffff"),
@@ -2015,8 +1969,6 @@ class ChatWindow:
         t.tag_configure("author", foreground="#e8e8e8" if chroma else FG2, font=self.f["author"])
         t.tag_configure("member", foreground="#ffe57f" if chroma else MEMBER, font=self.f["author"])
         t.tag_configure("mod", foreground="#b5c8ff" if chroma else MOD, font=self.f["author"])
-        # 유튜브에서 채널 주인(방장) 이름은 노란 바탕
-        t.tag_configure("owner", foreground="#0f0f0f", background=OWNER, font=self.f["author"])
         t.tag_configure("msg", foreground="#ffffff" if chroma else FG, font=self.f["msg"])
         t.tag_configure("card", spacing1=self.px(4), spacing3=self.px(4))
         self.lbl_viewers.configure(text=self.lbl_viewers.cget("text") if self.app.cfg.get("show_viewers", True) else "")
@@ -2268,69 +2220,27 @@ class ChatWindow:
     def scroll_end(self):
         self.text.yview_moveto(1.0)
 
-    # ----- 입력창: 방장이 직접 채팅을 치면 시청자들이 반응함 (fake-twitch-chat의 "채팅에 말 걸기") -----
+    # ----- 입력창 (보기용) -----
     def build_composer(self):
         cp = self.composer
         for w in cp.winfo_children():
             w.destroy()
-        name = self.app.cfg.get("streamer_name") or "방장"
         tk.Frame(cp, bg=LINE, height=1).pack(fill="x")
         inner = tk.Frame(cp, bg=BG)
         inner.pack(fill="x", padx=self.px(16), pady=(self.px(12), self.px(8)))
         top = tk.Frame(inner, bg=BG)
         top.pack(fill="x")
-        tk.Label(top, image=self.avatar(name, self.px(24), self.px(16)), bg=BG).pack(side="left")
-        tk.Label(top, text=name, bg=BG, fg=FG2, font=self.f["author"]).pack(side="left")
+        tk.Label(top, image=self.avatar("시청자", self.px(24), self.px(16)), bg=BG).pack(side="left")
+        tk.Label(top, text="시청자", bg=BG, fg=FG2, font=self.f["author"]).pack(side="left")
         field = tk.Frame(inner, bg=BG)
         field.pack(fill="x", padx=(self.px(40), 0), pady=(self.px(6), 0))
-        self.entry_var = tk.StringVar()
-        self.entry = tk.Entry(field, textvariable=self.entry_var, bg=BG, fg=FG, insertbackground=FG, relief="flat",
-                              bd=0, highlightthickness=0, font=self.f["input"])
-        self.entry.pack(fill="x")
-        hint = tk.Label(field, text="채팅...", bg=BG, fg="#717171", font=self.f["input"], anchor="w", cursor="xterm")
-        underline = tk.Frame(field, bg="#717171", height=1)
-        underline.pack(fill="x", pady=(self.px(4), 0))
+        tk.Label(field, text="채팅...", bg=BG, fg="#717171", font=self.f["input"], anchor="w").pack(fill="x")
+        tk.Frame(field, bg="#717171", height=1).pack(fill="x", pady=(self.px(4), 0))
         foot = tk.Frame(inner, bg=BG)
         foot.pack(fill="x", padx=(self.px(34), 0), pady=(self.px(6), 0))
         tk.Label(foot, text="☺", bg=BG, fg=FG2, font=self.f["title"]).pack(side="left")
-        send = tk.Label(foot, text="➤", bg=BG, fg="#717171", font=self.f["title"], cursor="hand2")
-        send.pack(side="right")
-        count = tk.Label(foot, text="0/200", bg=BG, fg="#717171", font=self.f["small"])
-        count.pack(side="right", padx=self.px(8))
-
-        def show_hint():
-            try:
-                focused = self.root.focus_get() is self.entry
-            except (KeyError, tk.TclError):     # 메뉴가 열려 있으면 focus_get이 실패할 수 있음
-                focused = False
-            if not self.entry_var.get() and not focused:
-                hint.place(in_=self.entry, x=0, rely=0.5, anchor="w")
-            else:
-                hint.place_forget()
-
-        def changed(*_):
-            v = self.entry_var.get()
-            if len(v) > 200:
-                self.entry_var.set(v[:200])
-                return
-            count.configure(text=f"{len(v)}/200")
-            send.configure(fg="#3ea6ff" if v.strip() else "#717171")
-            show_hint()
-
-        def submit(_e=None):
-            v = self.entry_var.get().strip()
-            if v:
-                self.entry_var.set("")
-                self.app.send_user_chat(v)
-            return "break"
-
-        self.entry_var.trace_add("write", changed)
-        self.entry.bind("<Return>", submit)
-        self.entry.bind("<FocusIn>", lambda e: (hint.place_forget(), underline.configure(bg="#3ea6ff")))
-        self.entry.bind("<FocusOut>", lambda e: (show_hint(), underline.configure(bg="#717171")))
-        hint.bind("<Button-1>", lambda e: self.entry.focus_set())
-        send.bind("<Button-1>", submit)
-        self.root.after(50, show_hint)
+        tk.Label(foot, text="➤", bg=BG, fg="#717171", font=self.f["title"]).pack(side="right")
+        tk.Label(foot, text="0/200", bg=BG, fg="#717171", font=self.f["small"]).pack(side="right", padx=self.px(8))
 
     # ----- 메시지 넣기 -----
     def add(self, m: dict):
@@ -2358,8 +2268,8 @@ class ChatWindow:
         else:
             a = t.index("end-1c")
             t.image_create("end", image=self.avatar(m["name"], self.px(24 * s), self.px(16)), align="center")
-            tag = m["kind"] if m["kind"] in ("member", "mod", "owner") else "author"
-            t.insert("end", f" {m['name']} " if m["kind"] == "owner" else m["name"], (tag,))
+            tag = m["kind"] if m["kind"] in ("member", "mod") else "author"
+            t.insert("end", m["name"], (tag,))
             b = self.badge(m["kind"]) if m["kind"] in ("member", "mod") else None
             if b is not None:
                 t.image_create("end", image=b, align="center")
@@ -2431,7 +2341,6 @@ class ChatWindow:
                                value=n, variable=self.v_int, command=lambda: toggle("chat_intensity", self.v_int))
         mm.add_cascade(label="분위기 세기", menu=mi)
         m.add_cascade(label="채팅 분위기", menu=mm)
-        m.add_command(label="내 채팅 이름…", command=self.app.open_name_dialog)
         m.add_command(label="채팅 캡처 저장 (최근 12줄)", command=self.app.save_clip)
         m.add_separator()
         # 해설 자막 (realtime-captions-system-audio)
@@ -3029,30 +2938,6 @@ class LineupEditor:
         self.top.destroy()
 
 
-class NameDialog:
-    """입력창에 쓴 내 채팅이 뜨는 이름"""
-
-    def __init__(self, app):
-        self.app = app
-        t = tk.Toplevel(app.root)
-        t.title("내 채팅 이름")
-        t.attributes("-topmost", True)
-        t.configure(padx=14, pady=12)
-        self.t = t
-        tk.Label(t, text="입력칸에 쓴 내 채팅이 이 이름(노란색)으로 뜹니다.").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self.name = ttk.Entry(t, width=20)
-        self.name.grid(row=1, column=0, sticky="w")
-        self.name.insert(0, app.cfg.get("streamer_name") or "방장")
-        self.name.bind("<Return>", lambda e: self.apply())
-        ttk.Button(t, text="저장", command=self.apply).grid(row=1, column=1, sticky="e", padx=(8, 0))
-
-    def apply(self):
-        self.app.cfg["streamer_name"] = re.sub(r"\s+", " ", self.name.get()).strip()[:20] or "방장"
-        save_cfg(self.app.cfg)
-        self.app.chat.build_composer()
-        self.t.destroy()
-
-
 class TeamDialog:
     def __init__(self, app):
         self.app = app
@@ -3134,7 +3019,7 @@ class App:
         self.queue: list[tuple[float, dict]] = []   # (보여 줄 시각, 메시지) — 시각 순
         self.hype = 0.0                    # 큰 장면 직후 채팅이 몰리는 정도 (시간이 지나면 줄어듦)
         self.hype_t = time.time()
-        self.chat_log: list[dict] = []       # 화면에 나온 채팅 (방장이 부른 닉네임 찾기, 채팅 캡처)
+        self.chat_log: list[dict] = []       # 화면에 나온 채팅 (채팅 캡처)
         self.viewers = 0
         self.last_seen: dict[str, float] = {}
         self.last_board_goal: dict | None = None   # {"side", "t", "scorer"} — 스코어보드가 본 마지막 골
@@ -3396,7 +3281,7 @@ class App:
 
     def emit(self, m: dict):
         self.chat.add(m)
-        if m["kind"] in ("normal", "member", "mod", "owner"):
+        if m["kind"] in ("normal", "member", "mod"):
             self.chat_log = (self.chat_log + [{**m, "t": time.time()}])[-60:]
         now = time.time()
         for d, f in self.engine.followups(m, self.cur_hype()):
@@ -3789,31 +3674,6 @@ class App:
         m.mark(key, name, what)
         m.marks[team][name]["_card_at"] = time.time()
 
-    # ----- 방장 채팅 (입력창) -----
-    def recent_chat(self) -> list[dict]:
-        """2분 안의 마지막 12줄"""
-        now = time.time()
-        return [c for c in self.chat_log if now - c.get("t", 0) <= 120][-12:]
-
-    def send_user_chat(self, text: str):
-        """방장이 입력창에 쓴 채팅: 노란 이름으로 바로 띄우고, 시청자 여럿이 그 말에 반응"""
-        text = re.sub(r"[\r\n\t<>]+", " ", text).strip()[:200]
-        if not text or not self.session_on:
-            return
-        name = self.cfg.get("streamer_name") or "방장"
-        self.emit({"name": name, "text": text, "kind": "owner", "amount": 0, "side": "neutral"})
-        self.chat.scroll_end()
-        if not self.live:                 # 킥오프 전에는 시청자 채팅이 안 나옴
-            return
-        # 방장이 최근 채팅의 누군가를 부르면 (@닉네임이든 그냥 닉네임이든) 그 사람이 대답
-        mention = next((c["name"] for c in reversed(self.recent_chat())
-                        if c.get("kind") != "owner" and len(c["name"].lstrip("@")) >= 2 and c["name"].lstrip("@") in text), None)
-        msgs = self.engine.host_replies(text, mention)
-        if mention and msgs and msgs[0]["name"] == mention:     # 부른 사람이 먼저 대답
-            self.enqueue(msgs[:1], 0.6, 1.8)
-            msgs = msgs[1:]
-        self.enqueue(msgs, 1.0, 5.0)
-
     # ----- 해설 받아쓰기 저장 -----
     def write_transcript(self, text: str):
         if not self.cfg.get("save_transcript", False) or DEMO:
@@ -3858,7 +3718,7 @@ class App:
             text_x, line_h = pad + av + 16 * S, 20 * S
             lines = []                                        # (메시지, [(줄 글자, 이름 자리 포함 여부)])
             for m in rows:
-                name_w = probe.textlength(m["name"] + "  ", font=f_name) + (8 * S if m["kind"] == "owner" else 0)
+                name_w = probe.textlength(m["name"] + "  ", font=f_name)
                 words, cur, first, out = m["text"].split(" "), "", True, []
                 for w in words:
                     room = W - pad - text_x - (name_w if first else 0)
@@ -3879,11 +3739,7 @@ class App:
                 d.ellipse((pad, y, pad + av, y + av), fill=color)
                 d.text((pad + av / 2, y + av / 2), (m["name"].lstrip("@")[:1] or "?").upper(), font=f_av, fill="white", anchor="mm")
                 nc = {"member": MEMBER, "mod": MOD}.get(m["kind"], FG2)
-                if m["kind"] == "owner":
-                    d.rounded_rectangle((text_x, y + 2 * S, text_x + name_w - 6 * S, y + line_h - 2 * S), radius=2 * S, fill=OWNER)
-                    d.text((text_x + 4 * S, y + line_h / 2), m["name"], font=f_name, fill="#0f0f0f", anchor="lm")
-                else:
-                    d.text((text_x, y + line_h / 2), m["name"], font=f_name, fill=nc, anchor="lm")
+                d.text((text_x, y + line_h / 2), m["name"], font=f_name, fill=nc, anchor="lm")
                 for i, ln in enumerate(out):
                     d.text((text_x + (name_w if i == 0 else 0), y + line_h / 2 + i * line_h), ln, font=f_msg, fill=FG, anchor="lm")
                 y += max(av, len(out) * line_h) + gap
@@ -4074,8 +3930,6 @@ class App:
     def open_mark_dialog(self):
         MarkDialog(self)
 
-    def open_name_dialog(self):
-        NameDialog(self)
 
     def quit(self):
         try:
