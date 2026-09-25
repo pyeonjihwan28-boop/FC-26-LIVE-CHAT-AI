@@ -442,7 +442,7 @@ P = {
     "kor_idle": ["{k} 화이팅!!", "{k} 오늘 폼 좋다", "{k} 공 좀 줘라", "한국 선수 나와서 봄 ㅋㅋ", "{k} 골 가자", "{k} 보러 왔습니다",
                  "{k} 나올 때마다 소리 지름", "대한민국 ♥", "{k} 터치 봐라"],
     "neu_idle": ["점유율 좋네", "빌드업 깔끔하다", "압박 좋다", "중원 싸움 치열하다", "ㅋㅋㅋㅋ", "롱볼 너무 많음", "역습 조심", "몇 분임?",
-                 "세트피스 기대", "ㅎㅇㅎㅇ", "방금 들어옴", "스코어 몇 대 몇?", "슈팅 좀 때리자", "난이도 뭐로 하세요?", "해설 목소리 좋다",
+                 "세트피스 기대", "ㅎㅇㅎㅇ", "방금 들어옴", "스코어 몇 대 몇?", "슈팅 좀 때리자", "해설 목소리 좋다",
                  "중립 기어 박고 봅니다", "오늘 전술 뭐임", "양 팀 다 잘하네", "템포 빠르다", "이 경기 끝까지 본다"],
 }
 P.update({
@@ -465,7 +465,7 @@ P["fan_idle"] += ["{t} 오늘 몸 가볍네", "{p} 폼 올라왔다", "{o} 오�
                   "{o} 팬 여기 있냐 ㅋㅋ", "{t} 전방 압박 미쳤다", "{p} 오늘 MOM 간다", "{t} 경기력 좋은데", "이 흐름 좋다",
                   "{o} 체력 떨어진 듯", "{t} 수비 라인 탄탄하네", "{p} 드리블 봐라", "{t} 세트피스 기대된다", "{o} 공격 별거 없음"]
 P["neu_idle"] += ["오늘 경기 템포 좋네", "누가 이길 것 같음?", "와 패스 깔끔하다", "양 팀 다 신중하네", "전술 싸움이네", "키퍼 오늘 바쁘겠다",
-                  "측면이 계속 뚫리네", "그래픽 좋다", "FC26 재밌네", "이거 커리어 모드임?", "슈팅 각 나왔는데", "크로스 좀 올려라",
+                  "측면이 계속 뚫리네", "잔디 상태 좋아 보인다", "감독 표정 봐 ㅋㅋ", "슈팅 각 나왔는데", "크로스 좀 올려라",
                   "오늘 날씨 좋아 보임 ㅋㅋ", "관중 분위기 좋다", "오늘 첫 골 누가 넣을까", "빌드업 느리다", "해설 텐션 좋네",
                   "ㅎㅇ 방금 옴", "이 경기 무승부각", "공 점유 비슷하네", "저녁 먹으면서 보는 중", "화질 좋네"]
 P["kor_idle"] += ["{k} 오늘 한 골 가자", "{k} 볼 터치 부드럽다", "{k} 나올 때마다 기대됨", "역시 {k}", "{k} 패스 센스 봐"]
@@ -490,8 +490,8 @@ CASUAL = ["감자", "고구마", "도토리", "밤톨", "초코", "뭉치", "하
           "지나가던행인", "눈팅만함", "새벽감성", "아무개", "무지개", "꿀벌", "햄찌", "펭귄", "다람쥐", "산책가자", "오늘도맑음",
           "축구보는곰", "주말엔축구", "공차는고양이", "왼발잡이", "조기축구에이스", "벤치워머", "만년후보", "침대축구반대"]
 CASUAL_TAIL = ["", "", "", "", "", "맘", "아빠", "짱", "님", "이", "22", "99", "0", "123", "_"]
-CHANNEL = ["{w}TV", "{w}의 일상", "{w}로그", "{w} 채널", "{w}브이로그", "{g}네 집", "{w}게임", "{g}의 축구일기"]
-ENG_WORDS = ["sunny", "daily", "noname", "kkkk", "zzz", "happy", "blue", "moon", "lucky", "chill", "cozy", "gamer", "footy", "pitch",
+CHANNEL = ["{w}TV", "{w}의 일상", "{w}로그", "{w} 채널", "{w}브이로그", "{g}네 집", "{w}축구", "{g}의 축구일기"]
+ENG_WORDS = ["sunny", "daily", "noname", "kkkk", "zzz", "happy", "blue", "moon", "lucky", "chill", "cozy", "goal", "footy", "pitch",
              "night", "coffee", "mango", "tiger", "panda"]
 FAN_TAGS = {"Manchester United": ["ggmu", "mufc", "redevil"], "Liverpool": ["ynwa", "lfc", "kopite"], "Arsenal": ["coyg", "gooner"],
             "Tottenham Hotspur": ["coys", "spurs", "thfc"], "Real Madrid": ["halamadrid", "madridista"],
@@ -551,9 +551,10 @@ def apply_learned():
         _BASE_POOLS.update({k: list(v) for k, v in P.items()})
     banned = set(LEARNED["banned"])
     for k, base in _BASE_POOLS.items():
-        merged = list(dict.fromkeys(base + LEARNED["lines"].get(k, [])))
+        merged = [t for t in dict.fromkeys(base + LEARNED["lines"].get(k, [])) if not GAMETALK_RX.search(t)]
         kept = [t for t in merged if t not in banned]
         P[k] = kept if len(kept) >= 4 else merged
+    LEARNED["names"] = [n for n in LEARNED["names"] if not GAMETALK_RX.search(n)]
 
 
 def valid_line(text: str) -> str | None:
@@ -573,7 +574,7 @@ def valid_name(name: str) -> str | None:
     n = re.sub(r"\s+", " ", str(name or "")).strip()
     if not (2 <= len(n) <= 20) or re.search(r"[<>{}\[\]\n]|http|www\.", n):
         return None
-    if n.count(" ") > 2 or FORMAL_RX.search(n):
+    if n.count(" ") > 2 or FORMAL_RX.search(n) or GAMETALK_RX.search(n):
         return None
     if any(norm(n) == norm(a) for t in TEAMS for a in [t["ko"], t["en"], *t["alias"]]):
         return None                       # 팀 이름 그 자체는 닉네임으로 안 씀
@@ -999,6 +1000,7 @@ class LocalAI:
 
 
 RULES = """채팅 규칙:
+- 이건 실제 축구 경기 생중계야. 시청자는 진짜 경기를 보는 축구 팬. 게임·FC26·피파·EA·난이도·커리어 모드·조작·패드·그래픽·유저·스트리머 같은 게임 이야기는 절대 쓰지 말 것.
 - 시청자는 한국인. 한국 유튜브 라이브 채팅 말투: 반말, 대부분 3~15자(길어도 25자), 띄어쓰기·맞춤법은 대충, 마침표는 거의 안 씀.
 - 말투 예: "와 이걸 넣네", "키퍼 뭐함ㅋㅋ", "ㄹㅇ 폼 미쳤다", "아 제발", "심판 뭐하냐", "몇대몇임?", "ㄷㄷ", "이건 PK지".
 - 쓰지 말 말투: "~습니다", "~입니다", "정말 멋진 골이에요!", 해설처럼 상황을 설명하는 문장, 이모지 남발, 해시태그, 따옴표.
@@ -1008,13 +1010,15 @@ RULES = """채팅 규칙:
 - 욕설, 비속어, 혐오 표현, 실존 인물 모욕 금지. 팬끼리 가벼운 신경전까지만.
 - name은 짧은 닉네임 아무거나. 실존 인물 이름 금지.
 - kind는 대부분 normal. amount는 super일 때만 1000~100000 원, 나머지는 0."""
+# 실제 축구 중계 채팅이므로 게임 이야기는 어디서 나오든 버림 (AI 채팅, 배운 문장, 닉네임)
+GAMETALK_RX = re.compile(r"(게임|겜|피파|fifa|fc\s*\d{2}|\bea\b|난이도|커리어|조작|패드|컨트롤러|그래픽|모드|유저|스트리머|방장|패치|업데이트|버그|프레임)", re.I)
 FORMAL_RX = re.compile(r"(습니다|습니까|ㅂ니다|입니다|여러분|#)")
 
 
 def clean_ai_text(text: str, kind: str) -> str | None:
     """AI가 만든 채팅 중 어색한 것은 버리고, 끝의 마침표 같은 건 다듬음"""
     t = re.sub(r"\s+", " ", str(text or "")).strip().strip('"“”\'「」')
-    if not t:
+    if not t or GAMETALK_RX.search(t):
         return None
     if kind == "super":
         return t[:120]
@@ -3040,7 +3044,7 @@ class App:
         before = (f"(그 직전 해설: {' / '.join(texts[:-1])})\n" if len(texts) > 1 else "")
         events = "\n".join(f"- {k}: {v}" for k, v in EVENTS.items())
         return (
-            "너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 방금 들어온 해설 한 문장을 보고 "
+            "너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 방금 들어온 해설 한 문장을 보고 "
             "(1) 어떤 장면인지 판단하고 (2) 그 장면에 시청자들이 바로 반응하는 채팅을 만들어.\n\n"
             f"{self.context()}\n\n{before}방금 해설: {text}\n\n"
             f"event 고르기:\n{events}\n"
@@ -3261,7 +3265,7 @@ class App:
                 f"시청자 세력: {m.home.label} 팬 {sp['home']:.1f}%, {m.away.label} 팬 {sp['away']:.1f}%, 중립 {sp['neutral']:.1f}%"
                 + (f"\n참고: {kor}" if kor else "") +
                 f"\n최근 사건: {' / '.join(m.events[-6:]) or '없음'}\n"
-                f"최근 게임 해설(음성 받아쓰기라 오타가 있을 수 있음):\n{recent}")
+                f"최근 중계 해설(음성 받아쓰기라 오타가 있을 수 있음):\n{recent}")
 
     def ai_ready(self):
         return self.cfg.get("use_ai", True) and self.ai.available()
@@ -3274,7 +3278,7 @@ class App:
         desc = {"hgoal": f"{self.match.home.label} 득점!", "agoal": f"{self.match.away.label} 득점!"}.get(ev, EV_DESC.get(ev, ev))
         sup = ("큰 장면이니 kind super(후원 채팅)를 1~2개 섞을 것. 후원은 주로 기뻐하는 쪽 팬이 보냄." if ev in ("hgoal", "agoal")
                else "kind super는 쓰지 말 것.")
-        prompt = (f"너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 방금 장면에 시청자들이 반응하는 채팅 {n}개를 만들어.\n\n"
+        prompt = (f"너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 방금 장면에 시청자들이 반응하는 채팅 {n}개를 만들어.\n\n"
                   f"{self.context()}\n\n방금 해설: {text or '(자료 없음)'}\n장면: {desc}\n\n{RULES}\n- {sup}\n- scored는 none.")
         self.aiw.submit(0, {"type": "chat", "prompt": prompt, "ev": ev, "fallback_ev": ev if ev in ("hgoal", "agoal") else None})
 
@@ -3282,7 +3286,7 @@ class App:
         if not self.ai_ready() or time.time() - self.last_pool_req < 40:
             return
         self.last_pool_req = time.time()
-        prompt = (f"너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 특별한 사건이 없을 때 흘러가는 평범한 잡담 30개를 만들어. "
+        prompt = (f"너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 특별한 사건이 없을 때 흘러가는 평범한 잡담 30개를 만들어. "
                   f"팬들의 응원·신경전, 중립 팬의 전술 이야기, 선수 이야기, 인사, 먹을 것, 예측 같은 주제. 골이나 실점 이야기는 하지 말 것.\n\n"
                   f"{self.context()}\n\n{RULES}\n- kind super는 쓰지 말 것.\n- scored는 none.")
         self.aiw.submit(1, {"type": "chat", "prompt": prompt, "idle": True})
@@ -3293,7 +3297,7 @@ class App:
         if (self.session_on and self.live and quiet and time.time() - self.last_ai_flow > 18 and self.ai_ready()):
             self.last_ai_flow = time.time()
             k = random.randint(5, 7)
-            prompt = (f"너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 방금까지의 해설 흐름을 보고 시청자들이 쓸 법한 채팅 {k}개를 만들어. "
+            prompt = (f"너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 방금까지의 해설 흐름을 보고 시청자들이 쓸 법한 채팅 {k}개를 만들어. "
                       f"큰 사건이 없으면 경기 흐름, 선수, 해설이 한 말에 대한 가벼운 반응과 팬끼리의 신경전 위주로.\n\n"
                       f"{self.context()}\n\n{RULES}\n- kind super는 쓰지 말 것.\n- scored는 none.")
             self.aiw.submit(2, {"type": "chat", "prompt": prompt})
@@ -3311,7 +3315,7 @@ class App:
         name_list = "\n".join(f"{i}. {n}" for i, n in enumerate(names))
         pools = "\n".join(f"- {k}: {v}" for k, v in POOL_DESC.items())
         prompt = (
-            "너는 한국 유튜브 라이브 채팅을 아주 많이 본 검수자야. 아래는 축구 게임(FC 26) 방송에서 자동으로 만든 가짜 채팅 기록이야. "
+            "너는 한국 유튜브 라이브 채팅을 아주 많이 본 검수자야. 아래는 실제 축구 경기 생중계 방송에서 자동으로 만든 가짜 채팅 기록이야. "
             "진짜 한국 시청자가 쓴 것처럼 보이게 다듬는 게 목표야.\n\n"
             f"[채팅 기록]\n{chats}\n\n[닉네임 목록]\n{name_list}\n\n"
             "할 일:\n"
