@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import functools
+import unicodedata
 import io
 import json
 import logging
@@ -551,6 +552,7 @@ P["neu_idle"] += ["오늘 경기 템포 좋네", "누가 이길 것 같음?", "�
                   "오늘 날씨 좋아 보임 ㅋㅋ", "관중 분위기 좋다", "오늘 첫 골 누가 넣을까", "빌드업 느리다", "해설 텐션 좋네",
                   "ㅎㅇ 방금 옴", "이 경기 무승부각", "공 점유 비슷하네", "저녁 먹으면서 보는 중", "화질 좋네"]
 P["kor_idle"] += ["{k} 오늘 한 골 가자", "{k} 볼 터치 부드럽다", "{k} 나올 때마다 기대됨", "역시 {k}", "{k} 패스 센스 봐"]
+P["scorer"] = ["{n} 골!!", "{n} 미쳤다", "역시 {n}", "{n} 해냈다!!", "{n} 폼 뭐냐", "{n}이 넣었네 ㄷㄷ", "{n} 클래스", "{n} 사랑한다"]
 P["spam"] = ["골!!!!", "골!!!!!!!", "GOAL!!!", "ㅋㅋㅋㅋㅋㅋ", "와아아아", "⚽⚽⚽", "골골골", "들어갔다!!"]
 P["super_idle"] = ["{t} 화이팅!!", "오늘도 잘 보고 갑니다", "경기 재밌게 보는 중 ㅎㅎ", "{t} 이기자!!", "치킨 값 보탭니다 ㅋㅋ",
                    "응원합니다!!", "{p} 오늘 골 넣어줘", "첫 후원입니다 ㅎㅎ", "야식 먹으면서 보는 중", "{t} 사랑해요"]
@@ -1069,7 +1071,7 @@ class LocalAI:
             "required": ["bad_chat_ids", "bad_name_ids", "new_lines", "new_names"]}
         return self._chat(prompt, schema, num_predict=1400, timeout=150)
 
-    def squad(self, prompt: str) -> dict:
+    def arrange(self, prompt: str) -> dict:
         person = {"type": "object", "properties": {"no": {"type": "string"}, "name_ko": {"type": "string"},
                                                    "name_en": {"type": "string"}}, "required": ["no", "name_ko", "name_en"]}
         schema = {"type": "object", "properties": {
@@ -1195,8 +1197,8 @@ class AIWorker(threading.Thread):
             self.bus.put(("teams_ai", self.ai.identify(job["image"])))
         elif kind == "review":
             self.bus.put(("ai_review", {"job": job, "res": self.ai.review(job["prompt"])}))
-        elif kind == "squad":
-            self.bus.put(("squad", {"job": job, "res": self.ai.squad(job["prompt"])}))
+        elif kind == "arrange":
+            self.bus.put(("arranged", {"job": job, "res": self.ai.arrange(job["prompt"])}))
         elif kind == "react":
             if time.time() - job["t"] > 12:      # 한참 지난 해설은 건너뜀 (지금 해설부터)
                 return
@@ -1574,6 +1576,98 @@ def parse_board(items: list[tuple[float, float, str]]):
     return {"codes": (h, a), "score": (hs, as_), "minute": minute}
 
 
+# 일시정지 화면의 선발 라인업 목록: 왼쪽 = 홈 팀 ("10 Parejo"), 오른쪽 = 원정 팀 ("Lamine Yamal 10")
+LINEUP_LEFT = (0.03, 0.30, 0.24, 0.50)      # 화면 비율 (왼쪽, 위, 폭, 높이)
+LINEUP_RIGHT = (0.73, 0.30, 0.24, 0.50)
+NAME_CH = r"A-Za-zÀ-ÖØ-öø-ÿĀ-ž"
+
+
+def parse_lineup_column(items: list[tuple[float, float, str]], row_tol: float, right: bool) -> list[tuple[str, str]]:
+    """OCR 조각 (y, x, 글자) → [(등번호, 이름)], 위에서 아래 순서.
+    주장(C)·골 아이콘처럼 한 글자짜리 조각은 버림."""
+    rows: list[list] = []
+    for y, x, t in sorted(items):
+        t = t.strip()
+        if not t:
+            continue
+        if rows and abs(rows[-1][0] - y) < row_tol:
+            rows[-1][1].append((x, t))
+        else:
+            rows.append([y, [(x, t)]])
+    out = []
+    for _, parts in rows:
+        toks = " ".join(t for _, t in sorted(parts)).split()
+        toks = [t for t in toks if not (len(t) == 1 and not t.isdigit()) and t not in ("(C)", "[C]", "©")]
+        line = " ".join(toks)
+        m = (re.match(rf"^.*?(?<!\d)(\d{{1,2}})\s+([{NAME_CH}].*?)$", line) if right is False
+             else re.match(rf"^([{NAME_CH}].*?[{NAME_CH}.])\s*(\d{{1,2}})(?!\d).*$", line))
+        if not m:
+            continue
+        no, name = (m.group(1), m.group(2)) if not right else (m.group(2), m.group(1))
+        name = re.sub(rf"[^{NAME_CH}.\-' ]", "", name).strip(" -").lstrip(".")
+        if len(re.sub(rf"[^{NAME_CH}]", "", name)) >= 2:
+            out.append((no, name))
+    return out
+
+
+PLAYER_HUD = (0.0, 0.80, 1.0, 0.20)          # 화면 아래: 조작 중인 선수 표시 ("DIAS 33"), 골 뒤 득점자 이름
+
+
+SQUAD_PITCH = (0.04, 0.14, 0.54, 0.50)        # 팀 관리 화면의 경기장 그림 (선수 이름이 포메이션 모양으로 놓임)
+
+
+def parse_squad_pitch(items: list[tuple[float, float, str]], height: float) -> dict | None:
+    """경기장 그림 속 선수 이름 (y, x, 글자) → {"formation": "4-2-3-1", "rows": [[골키퍼], [수비 왼→오], …]}.
+    이름의 세로 위치로 줄을 나눔 (원근 때문에 양쪽 풀백이 조금 위에 있어도 한 줄로)."""
+    names = []
+    for y, x, t in items:
+        t = re.sub(rf"[^{NAME_CH}.\-' ]", "", t).strip(" .-")
+        if len(re.sub(rf"[^{NAME_CH}]", "", t)) >= 3:
+            names.append((y, x, t))
+    if len(names) != 11:
+        return None
+    names.sort()
+    rows: list[list] = [[names[0]]]
+    for n in names[1:]:
+        if n[0] - rows[-1][-1][0] > height * 0.03:
+            rows.append([n])
+        else:
+            rows[-1].append(n)
+    rows.reverse()                                    # 아래(골키퍼)부터
+    if len(rows[0]) != 1 or not (3 <= len(rows) - 1 <= 5) or any(len(r) > 5 for r in rows[1:]):
+        return None
+    ordered = [[t for _, _, t in sorted(r, key=lambda n: n[1])] for r in rows]
+    return {"formation": "-".join(str(len(r)) for r in rows[1:]), "rows": ordered}
+
+
+def ocr_lines(items: list[tuple[float, float, str]], row_tol: float) -> list[str]:
+    """OCR 조각 (y, x, 글자) → 줄 단위 글"""
+    rows: list[list] = []
+    for y, x, t in sorted(items):
+        if rows and abs(rows[-1][0] - y) < row_tol:
+            rows[-1][1].append((x, t))
+        else:
+            rows.append([y, [(x, t)]])
+    return [" ".join(t for _, t in sorted(parts)).strip() for _, parts in rows]
+
+
+def plain(s: str) -> str:
+    """악센트·대소문자 무시 (Rúben = RUBEN)"""
+    return unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
+
+
+def fc_to_overlay_order(players: list[dict], formation: str) -> list[dict]:
+    """게임 목록 순서(골키퍼, 수비 오른쪽→왼쪽, 미드 오른쪽→왼쪽 …)를 명단 그림 순서(각 줄 왼쪽→오른쪽)로"""
+    rows = formation_rows(formation)
+    if len(players) != sum(rows) + 1:
+        return players
+    out, i = [players[0]], 1
+    for k in rows:
+        out += list(reversed(players[i:i + k]))
+        i += k
+    return out
+
+
 def primary_monitor():
     try:
         import mss
@@ -1588,12 +1682,68 @@ def primary_monitor():
 
 
 class BoardWatcher(threading.Thread):
-    def __init__(self, cfg, bus: queue.Queue, need_ident_fn, ai_worker: AIWorker, ai: LocalAI):
+    def __init__(self, cfg, bus: queue.Queue, need_ident_fn, ai_worker: AIWorker, ai: LocalAI, hud_fn=lambda: False):
         super().__init__(daemon=True, name="board")
-        self.cfg, self.bus, self.need_ident_fn = cfg, bus, need_ident_fn
+        self.cfg, self.bus, self.need_ident_fn, self.hud_fn = cfg, bus, need_ident_fn, hud_fn
         self.aiw, self.ai = ai_worker, ai
         self.stop_flag = threading.Event()
         self.last_ident = 0.0
+        self.board_miss = 0              # 스코어보드를 연달아 못 읽은 횟수 (일시정지·메뉴 화면)
+        self.last_lineup_check = 0.0
+        self.last_lineup_sig = None
+        self.last_squad_sig = None
+
+    def read_hud(self, sct, mon, ocr, np):
+        """화면 아래 글자를 읽어 보냄 → App이 명단과 맞춰 '지금 조작 중인 선수'와 '골 넣은 선수'를 찾음"""
+        l, t, w, h = PLAYER_HUD
+        reg = {"left": int(mon["left"] + l * mon["width"]), "top": int(mon["top"] + t * mon["height"]),
+               "width": int(w * mon["width"]), "height": int(h * mon["height"])}
+        shot = np.array(sct.grab(reg))[:, :, :3].copy()   # BGR
+        result, _ = ocr(shot)
+        items = [(sum(p[1] for p in box) / 4, sum(p[0] for p in box) / 4, txt) for box, txt, _s in (result or [])]
+        lines = [x for x in ocr_lines(items, row_tol=mon["height"] * 0.012) if re.search(rf"[{NAME_CH}]{{2}}", x)]
+        if lines:
+            self.bus.put(("hud", {"t": time.time(), "lines": lines}))
+
+    def read_squad_screen(self, sct, mon, ocr, np, Image):
+        """팀 관리(스쿼드) 화면이면 내 팀 포메이션과 자리를 보냄"""
+        l, t, w, h = SQUAD_PITCH
+        reg = {"left": int(mon["left"] + l * mon["width"]), "top": int(mon["top"] + t * mon["height"]),
+               "width": int(w * mon["width"]), "height": int(h * mon["height"])}
+        shot = np.array(sct.grab(reg))[:, :, :3].copy()   # BGR
+        result, _ = ocr(shot)
+        items = [(sum(p[1] for p in box) / 4, sum(p[0] for p in box) / 4, txt) for box, txt, _s in (result or [])]
+        parsed = parse_squad_pitch(items, mon["height"])
+        if not parsed:
+            return
+        sig = (parsed["formation"], tuple(n for r in parsed["rows"] for n in r))
+        if sig == self.last_squad_sig:
+            return
+        self.last_squad_sig = sig
+        log.info("squad screen: %s %s", parsed["formation"], parsed["rows"])
+        self.bus.put(("squad_screen", parsed))
+
+    def read_lineup_screen(self, sct, mon, ocr, np, Image):
+        """스코어보드가 안 보일 때만 호출: 선발 라인업 화면이면 두 팀 명단을 보냄"""
+        cols = []
+        for (l, t, w, h), right in ((LINEUP_LEFT, False), (LINEUP_RIGHT, True)):
+            reg = {"left": int(mon["left"] + l * mon["width"]), "top": int(mon["top"] + t * mon["height"]),
+                   "width": int(w * mon["width"]), "height": int(h * mon["height"])}
+            img = Image.fromarray(np.array(sct.grab(reg))[:, :, :3][:, :, ::-1])
+            big = img.resize((img.width * 2, img.height * 2))
+            result, _ = ocr(np.array(big)[:, :, ::-1].copy())
+            items = [(sum(p[1] for p in box) / 4, sum(p[0] for p in box) / 4, txt) for box, txt, _s in (result or [])]
+            cols.append(parse_lineup_column(items, row_tol=mon["height"] * 0.012 * 2, right=right))
+            if len(cols[-1]) < 9:          # 선발 라인업 목록이 아님 → 팀 관리 화면인지
+                self.read_squad_screen(sct, mon, ocr, np, Image)
+                return
+        home, away = cols
+        sig = (tuple(n for n, _ in home), tuple(n for n, _ in away))
+        if sig == self.last_lineup_sig:
+            return
+        self.last_lineup_sig = sig
+        log.info("lineup screen: home=%s | away=%s", home, away)
+        self.bus.put(("lineup_screen", {"home": home[:11], "away": away[:11]}))
 
     def run(self):
         try:
@@ -1614,9 +1764,16 @@ class BoardWatcher(threading.Thread):
         with getattr(mss, "MSS", mss.mss)() as sct:
             if mon is None:
                 mon = sct.monitors[1]
+            tick = 0
             while not self.stop_flag.is_set():
                 t0 = time.time()
+                tick += 1
                 try:
+                    # 선수 표시는 1.5초마다 (골 넣은 선수를 놓치지 않게), 스코어보드는 3초마다
+                    if ocr is not None and self.hud_fn():
+                        self.read_hud(sct, mon, ocr, np)
+                    if tick % 2:
+                        raise StopIteration
                     l, t, w, h = self.cfg.get("scoreboard_region", [0, 0, 0.5, 0.16])
                     reg = {"left": int(mon["left"] + l * mon["width"]), "top": int(mon["top"] + t * mon["height"]),
                            "width": max(40, int(w * mon["width"])), "height": max(20, int(h * mon["height"]))}
@@ -1634,6 +1791,11 @@ class BoardWatcher(threading.Thread):
                         parsed = parse_board(items)
                         if parsed:
                             self.bus.put(("board", parsed))
+                        self.board_miss = 0 if (parsed and "codes" in parsed) else self.board_miss + 1
+                        # 스코어보드가 안 보이면(일시정지·메뉴) 선발 라인업 화면인지 4초마다 확인
+                        if self.board_miss >= 2 and time.time() - self.last_lineup_check > 4:
+                            self.last_lineup_check = time.time()
+                            self.read_lineup_screen(sct, mon, ocr, np, Image)
                     # 팀을 아직 모르면 15초마다 화면 위쪽 전체(스코어보드·엠블럼·광고판)를 AI에게 보여 줌
                     if self.need_ident_fn() and time.time() - self.last_ident > 15 and self.ai.available():
                         self.last_ident = time.time()
@@ -1644,9 +1806,11 @@ class BoardWatcher(threading.Thread):
                         bio = io.BytesIO()
                         crop.save(bio, format="JPEG", quality=88)
                         self.aiw.submit(0, {"type": "identify", "image": base64.b64encode(bio.getvalue()).decode()})
+                except StopIteration:
+                    pass
                 except Exception:
                     log.exception("board loop")
-                self.stop_flag.wait(max(0.5, 3.0 - (time.time() - t0)))
+                self.stop_flag.wait(max(0.3, 1.5 - (time.time() - t0)))
 
     def stop(self):
         self.stop_flag.set()
@@ -2765,8 +2929,10 @@ class App:
         self.last_review = time.time()
         self.viewers = 0
         self.last_seen: dict[str, float] = {}
-        self.pending_scorer = None         # (팀, 선수, 시각) — AI가 골이라고 판단한 득점자
-        self.last_board_goal = None        # (팀, 시각) — 마지막으로 점수를 올린 때
+        self.last_board_goal: dict | None = None   # {"side", "t", "scorer"} — 스코어보드가 본 마지막 골
+        self.last_ai_goal_at = 0.0         # 해설에서 AI가 골이라고 반응한 때 (채팅만, 점수는 안 셈)
+        self.hud_hist: list[tuple[float, str, str]] = []   # (시각, 팀, 선수) — 화면 아래 선수 표시 기록
+        self.user_side_votes = {"home": 0, "away": 0}      # 선수 표시에 자주 나오는 팀 = 내가 조작하는 팀
         self.board_prev = None
         self.board_stable = None
         self.teams_known = False
@@ -2774,7 +2940,8 @@ class App:
         self.last_ai_flow = 0.0
         self.last_ai_comment_n = 0
         self.alias_counts: dict[str, int] = {}
-        self.squad_asked: dict[str, float] = {}     # 팀 이름 → AI에게 명단을 물어본 시각
+        self.pending_screen: dict | None = None      # 팀을 알기 전에 읽은 선발 라인업 화면
+        self.pending_squad: dict | None = None       # 명단을 알기 전에 읽은 팀 관리 화면 (포메이션)
         self.idle_pool: list[dict] = []
         self.place_chat_window()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -2824,7 +2991,8 @@ class App:
         if not self.args.demo:
             self.stt = AudioSTT(self.cfg, self.bus, self.whisper_prompt)
             self.stt.start()
-            self.board = BoardWatcher(self.cfg, self.bus, lambda: not self.teams_known and not self.teams_locked, self.aiw, self.ai)
+            self.board = BoardWatcher(self.cfg, self.bus, lambda: not self.teams_known and not self.teams_locked, self.aiw, self.ai,
+                                      hud_fn=lambda: self.live and bool(self.match.lineup("home") or self.match.lineup("away")))
             self.board.start()
         self.viewers = int(self.match.viewer_floor() * (1 + random.random() * 0.12))
         self.chat.set_viewers(self.viewers)
@@ -2933,7 +3101,9 @@ class App:
         self.match.reset_for_new_match()
         self.on_split_changed()
         self.refresh_overlay()
-        self.ensure_lineups()
+        if self.pending_screen:
+            data, self.pending_screen = self.pending_screen, None
+            self.on_lineup_screen(data)
         self.request_idle_pool()
         log.info("teams: %s vs %s", self.match.home.label, self.match.away.label)
 
@@ -3095,8 +3265,14 @@ class App:
                 self.teams_changed()
         elif kind == "ai_chats":
             self.on_ai_chats(data)
-        elif kind == "squad":
-            self.on_squad(data)
+        elif kind == "hud":
+            self.on_hud(data)
+        elif kind == "squad_screen":
+            self.on_squad_screen(data)
+        elif kind == "lineup_screen":
+            self.on_lineup_screen(data)
+        elif kind == "arranged":
+            self.on_arranged(data)
         elif kind == "ai_react_head":
             self.on_ai_react_head(data)
         elif kind == "ai_react_chat":
@@ -3196,51 +3372,141 @@ class App:
                     return key, q["name"]
         return None, None
 
-    # ----- 선발 명단 자동 채우기 -----
-    def ensure_lineups(self):
-        """팀은 아는데 선발 명단이 없으면 AI에게 그 팀 선수들을 물어봄 (한국어·영어 이름)"""
-        if not self.ai_ready():
+    # ----- 선발 명단: 게임의 선발 라인업 화면에서 읽기 -----
+    def on_lineup_screen(self, data):
+        if not self.teams_known:                 # 팀을 찾으면 그때 붙임
+            self.pending_screen = data
             return
         for key in ("home", "away"):
-            side = self.match.side(key)
-            if not side.name or self.match.lineup(key) or time.time() - self.squad_asked.get(side.name, 0) < 300:
-                continue
-            self.squad_asked[side.name] = time.time()
-            t = lookup_team(side.name)
-            en = t["en"] if t else side.name
-            prompt = (f"{en} ({side.label}) 축구팀의 2025-26 시즌 주전 선발 11명과 교체 선수 7~9명을 알려 줘. 가장 최근 정보로.\n"
-                      "- formation: 이 팀이 주로 쓰는 포메이션 (예: 4-3-3, 4-2-3-1).\n"
-                      "- players: 정확히 11명. 순서는 골키퍼 → 수비 줄(왼쪽→오른쪽) → 미드필더 줄(왼쪽→오른쪽) → 공격 줄(왼쪽→오른쪽), "
-                      "포메이션 줄 수와 인원에 맞게.\n"
-                      "- no = 등번호, name_ko = 한국 중계에서 부르는 짧은 이름 (예: 야말, 레반도프스키, 페드리, 손흥민), "
-                      "name_en = 영어 이름 (예: Lamine Yamal).")
-            log.info("asking squad: %s", en)
-            self.aiw.submit(0, {"type": "squad", "team": side.label, "key": key, "prompt": prompt})
+            rows = data.get(key) or []
+            if len(rows) >= 9:
+                self.apply_screen_lineup(key, rows)
+        if self.pending_squad:
+            self.on_squad_screen(self.pending_squad)
+        self.refresh_overlay()
 
-    def on_squad(self, data):
-        job, res = data["job"], data["res"]
-
-        def person(q):
-            ko = re.sub(r"\s+", " ", str(q.get("name_ko") or "")).strip()[:16]
-            en = re.sub(r"\s+", " ", str(q.get("name_en") or "")).strip()[:30]
-            no = re.sub(r"\D", "", str(q.get("no") or ""))[:2]
-            return {"no": no, "name": ko or en, "en": en} if (ko or en) else None
-
-        players = [x for x in (person(q) for q in res.get("players", [])) if x][:11]
-        bench = [x for x in (person(q) for q in res.get("bench", [])) if x][:9]
-        form = str(res.get("formation", "")).strip()
-        if not re.fullmatch(r"\d(-\d){2,4}", form) or sum(int(x) for x in form.split("-")) != 10:
-            form = "4-3-3"
-        if len(players) < 11:
-            log.warning("squad for %s incomplete (%d)", job["team"], len(players))
+    def apply_screen_lineup(self, key, rows: list[tuple[str, str]]):
+        m = self.match
+        side = m.side(key)
+        lineups = self.cfg.setdefault("lineups", {})
+        old = lineups.get(side.label) or {}
+        order = [no for no, _ in rows]
+        prev = old.get("screen_order") or []
+        known = {q.get("no"): q for q in old.get("players", []) + old.get("bench", []) if q.get("no")}
+        if prev == order:
             return
-        side = self.match.side(job["key"])
-        if side.label != job["team"] or self.match.lineup(job["key"]):
-            return                                   # 그사이 팀이 바뀌었거나 사람이 명단을 넣음
-        self.cfg.setdefault("lineups", {})[job["team"]] = {"formation": form, "players": players, "bench": bench,
-                                                           "color": side.color, "auto": True}
+        # 같은 경기에서 몇 자리만 바뀌었으면 교체 (게임은 교체 선수를 나간 선수 자리에 둠)
+        if len(prev) == len(order) and sum(a != b for a, b in zip(prev, order)) <= 5 and old.get("players"):
+            players, bench = list(old["players"]), list(old.get("bench", []))
+            for i, (no, en) in enumerate(rows):
+                if prev[i] == no:
+                    continue
+                out_q = next((q for q in players if q.get("no") == prev[i]), None)
+                in_q = known.get(no) or {"no": no, "name": en, "en": en}
+                if out_q:
+                    players[players.index(out_q)] = in_q
+                    bench = [b for b in bench if b.get("no") != no] + [out_q]
+                    m.mark(key, out_q["name"], "off")
+                m.mark(key, in_q["name"], "on")
+                log.info("sub from lineup screen: %s out, %s in", out_q and out_q["name"], in_q["name"])
+            lineups[side.label] = {**old, "players": players, "bench": bench, "screen_order": order}
+        else:
+            # 새 명단: 등번호가 같은 선수는 전에 쓰던 한국어 이름을 그대로
+            people = []
+            for no, en in rows:
+                q = known.get(no)
+                people.append({"no": no, "name": q["name"], "en": en} if q and same_name(q.get("en") or q["name"], en) or
+                              (q and q["name"] == en) else {"no": no, "name": en, "en": en})
+            form = old.get("formation") or "4-3-3"
+            if old.get("formation_from_screen") and sorted(order) == sorted(q.get("no") for q in old.get("players", [])):
+                # 같은 선수들 — 팀 관리 화면에서 읽은 포메이션·자리 그대로
+                lineups[side.label] = {**old, "screen_order": order}
+            else:
+                lineups[side.label] = {"formation": form, "players": fc_to_overlay_order(people, form),
+                                       "bench": old.get("bench", []), "color": old.get("color", side.color), "screen_order": order}
+            self.ask_arrange(key, rows)
         save_cfg(self.cfg)
-        log.info("squad filled by ai: %s %s %s", job["team"], form, ", ".join(q["name"] for q in players))
+
+    def person_for(self, key: str, shown: str) -> dict | None:
+        """화면 이름('amine Yamal', 'Donnarumm' 처럼 잘려도)과 명단 선수 맞추기"""
+        words = [w for w in re.split(r"[\s.\-']+", plain(shown)) if len(w) >= 3]
+        for q in self.match.lineup_people(key):
+            full = plain((q.get("en") or "") + " " + q["name"])
+            if any(w in full for w in words) or any(len(w) >= 5 and w[:5] in full for w in words) or names_in_text(shown, [q["name"]]):
+                return q
+        return None
+
+    def on_squad_screen(self, data):
+        """팀 관리 화면 = 내 팀. 선발 명단 이름이 더 많이 맞는 쪽을 내 팀으로 보고 포메이션·자리를 그대로 씀."""
+        shown = [n for r in data["rows"] for n in r]
+        score = {k: sum(1 for n in shown if self.person_for(k, n)) for k in ("home", "away")}
+        key = max(score, key=score.get)
+        if score[key] < 8:
+            self.pending_squad = data                 # 선발 라인업 화면을 읽은 뒤에 적용
+            return
+        self.pending_squad = None
+        lu = self.cfg.get("lineups", {}).get(self.match.side(key).label)
+        ordered, used = [], set()
+        for n in shown:
+            q = self.person_for(key, n)
+            if q and q.get("no") not in used:
+                ordered.append(q)
+                used.add(q.get("no"))
+            else:
+                ordered.append(None)
+        rest = [q for q in lu.get("players", []) if q.get("no") not in used]
+        ordered = [q if q else rest.pop(0) for q in ordered if q or rest]
+        if len(ordered) != 11:
+            return
+        lu.update({"formation": data["formation"], "players": ordered, "formation_from_screen": True})
+        self.user_side_votes[key] += 5
+        save_cfg(self.cfg)
+        log.info("formation from squad screen: %s %s", self.match.side(key).label, data["formation"])
+        self.refresh_overlay()
+
+    def ask_arrange(self, key, rows):
+        """AI에게 포메이션·자리 순서·한국어 이름을 물어봄 (선수 목록은 화면에서 읽은 그대로)"""
+        if not self.ai_ready():
+            return
+        side = self.match.side(key)
+        t = lookup_team(side.name) if side.name else None
+        listing = "\n".join(f"{no} {en}" for no, en in rows)
+        prompt = (f"{t['en'] if t else side.label} 축구팀의 선발 11명이야 (등번호 이름, 경기 화면 목록에 나온 순서).\n{listing}\n\n"
+                  "- formation: 이 11명의 포지션으로 가장 알맞은 포메이션 (예: 4-3-3, 4-4-2, 4-2-3-1).\n"
+                  "- players: 위 11명 전부, 한 명도 빼거나 더하지 말 것. 순서는 골키퍼 → 수비 줄 → 미드필더 줄 → 공격 줄, "
+                  "각 줄 안에서는 왼쪽 → 오른쪽 (왼쪽 풀백·왼쪽 윙이 먼저). 포메이션 줄 수·인원과 맞게.\n"
+                  "- no·name_en은 위 목록 그대로, name_ko = 한국 중계에서 부르는 짧은 이름 (예: Lamine Yamal → 야말, Pedri → 페드리).")
+        self.aiw.submit(0, {"type": "arrange", "team": side.label, "key": key, "order": [no for no, _ in rows], "prompt": prompt})
+
+    def on_arranged(self, data):
+        job, res = data["job"], data["res"]
+        lu = self.cfg.get("lineups", {}).get(job["team"])
+        if not lu or lu.get("screen_order") != job["order"]:
+            return                                   # 그사이 명단이 바뀜
+        by_no = {q["no"]: q for q in lu.get("players", [])}
+        players = []
+        for q in res.get("players", []):
+            no = re.sub(r"\D", "", str(q.get("no") or ""))[:2]
+            if no in by_no and no not in [p["no"] for p in players]:
+                ko = re.sub(r"\s+", " ", str(q.get("name_ko") or "")).strip()[:16]
+                players.append({**by_no[no], "name": ko or by_no[no]["name"]})
+        form = str(res.get("formation", "")).strip()
+        if len(players) != len(by_no) or not re.fullmatch(r"\d(-\d){2,4}", form) or sum(int(x) for x in form.split("-")) != 10:
+            log.warning("arrange for %s rejected: %s", job["team"], res)
+            return
+        # 이미 경기 기록(골·카드)이 영어 이름으로 붙어 있으면 한국어 이름으로 옮김
+        marks = self.match.marks.get(job["team"], {})
+        for p in players:
+            old_name = by_no[p["no"]]["name"]
+            if old_name != p["name"] and old_name in marks:
+                marks[p["name"]] = marks.pop(old_name)
+        if lu.get("formation_from_screen"):
+            ko = {p["no"]: p["name"] for p in players}          # 내 팀은 화면에서 읽은 포메이션·자리 그대로, 이름만
+            lu["players"] = [{**q, "name": ko.get(q.get("no"), q["name"])} for q in lu["players"]]
+        else:
+            lu.update({"formation": form, "players": players})
+        save_cfg(self.cfg)
+        log.info("lineup arranged by ai: %s %s %s", job["team"], form, ", ".join(p["name"] for p in players))
         self.refresh_overlay()
 
     def mark_card(self, key, name, what):
@@ -3265,17 +3531,12 @@ class App:
         key, player = self.resolve_player(res.get("player"), team)
         team = team or key
         if ev == "goal":
+            # 골·점수·득점자는 화면(스코어보드·선수 표시)으로만 셈. 해설 반응은 채팅만.
             if not self.cooldown_ok("goal"):         # 같은 골을 해설이 또 말함
                 job["limit"] = min(job["limit"], 4)
                 return
+            self.last_ai_goal_at = time.time()
             self.add_hype(HYPE["goal"])
-            if self.board_stable is not None:        # 점수는 스코어보드가 셈. 득점자만 기억해 둠
-                self.pending_scorer = (team, player, time.time())
-                bg = self.last_board_goal
-                if bg and time.time() - bg[1] < 25 and player and (team in (None, bg[0])):
-                    self.mark_scorer(bg[0], player)
-            elif team:
-                self.goal(team, scorer=player, ai_live=True)
             return
         if ev in ("yellow", "red") and key and player:
             self.mark_card(key, player, ev)
@@ -3318,17 +3579,77 @@ class App:
         msgs, _ = self.ai_msgs({"chats": [data["chat"]]})
         self.enqueue(msgs, 0.1, 1.5)
 
-    def mark_scorer(self, side, name):
+    # ----- 화면 아래 선수 표시 → 조작 중인 선수, 득점자 -----
+    def match_hud(self, line: str) -> tuple[str, str] | None:
+        """'DIAS 33' → (팀, 명단 이름). 등번호가 먼저, 이름은 보조 (화면엔 성, 명단엔 이름만 있을 수 있음)"""
+        m = (re.search(rf"([{NAME_CH}][{NAME_CH}'.\- ]{{1,24}}?)\s*(\d{{1,2}})(?!\d)", line)
+             or re.search(rf"(?<!\d)(\d{{1,2}})\s+([{NAME_CH}][{NAME_CH}'.\- ]{{1,24}})", line))
+        if not m:
+            return None
+        txt, no = (m.group(1), m.group(2)) if not m.group(1).isdigit() else (m.group(2), m.group(1))
+        cands = [(k, q) for k in ("home", "away") for q in self.match.lineup_people(k) if q.get("no") == no]
+        if not cands:
+            return None
+        words = [w for w in re.split(r"[\s.\-']+", plain(txt)) if len(w) >= 3]
+
+        def name_ok(q):
+            full = plain((q.get("en") or "") + " " + q["name"])
+            return any(w in full for w in words) or bool(names_in_text(txt, [q["name"]]))
+
+        good = [c for c in cands if name_ok(c[1])]
+        if len(good) == 1 or len(cands) == 1:
+            key, q = (good or cands)[0]
+            self.user_side_votes[key] += 1
+            return key, q["name"]
+        mine = max(self.user_side_votes, key=self.user_side_votes.get)
+        pick = [c for c in (good or cands) if c[0] == mine]
+        if self.user_side_votes[mine] >= 3 and len(pick) == 1:
+            return pick[0][0], pick[0][1]["name"]
+        return None
+
+    def on_hud(self, data):
+        now = data["t"]
+        for line in data["lines"]:
+            hit = self.match_hud(line)
+            if hit:
+                self.hud_hist = [h for h in self.hud_hist if now - h[0] < 60] + [(now, hit[0], hit[1])]
+                break
+        # 골 뒤 화면 아래에 득점자 이름이 뜨면 (상대 팀 골도) 그걸로
+        bg = self.last_board_goal
+        if bg and not bg["scorer"] and now - bg["t"] < 45:
+            for line in data["lines"]:
+                low = plain(line)
+                for q in self.match.lineup_people(bg["side"]):
+                    parts = [w for w in re.split(r"[\s.\-']+", plain(q.get("en") or q["name"])) if len(w) >= 4]
+                    if any(re.search(rf"\b{re.escape(w)}\b", low) for w in parts) or names_in_text(line, [q["name"]]):
+                        self.set_scorer(bg, q["name"], "득점자 표시")
+                        return
+
+    def ball_holder(self) -> tuple[str, str] | None:
+        if self.hud_hist and time.time() - self.hud_hist[-1][0] < 5:
+            return self.hud_hist[-1][1], self.hud_hist[-1][2]
+        return None
+
+    def set_scorer(self, bg: dict, name: str, how: str):
         m = self.match
-        if name not in m.lineup_names(side):
-            return
+        side = bg["side"]
+        bg["scorer"] = name
         m.mark(side, name, "goal")
         if m.is_bench(side, name):
             m.mark(side, name, "on")
+        if m.events and m.events[-1].endswith("득점"):
+            m.events[-1] += f" ({name})"
+        log.info("scorer (%s): %s %s", how, m.side(side).label, name)
         self.refresh_overlay()
+        msgs = []
+        for _ in range(random.randint(2, 4)):
+            t = self.engine.choose(P["scorer"])
+            msgs.append(self.engine.msg(self.engine.fill(t, side, n=name), side, tpl=t))
+        self.enqueue(msgs, 0.3, 3.0)
 
-    def goal(self, side, text="", ai_msgs=None, scorer=None, ai_live=False):
-        """점수 올리기. 스코어보드가 점수 변화를 봤을 때, 또는 스코어보드가 없을 때 AI가 골이라고 했을 때."""
+    def goal(self, side, text=""):
+        """점수 올리기 — 스코어보드가 점수 변화를 봤을 때만 (해설로는 세지 않음).
+        득점자 = 골 직전 화면 아래에 표시된 그 팀 선수 (없으면 골 뒤 득점자 표시를 기다림)."""
         m = self.match
         if side == "home":
             m.hs += 1
@@ -3336,28 +3657,25 @@ class App:
             m.as_ += 1
         ev = "hgoal" if side == "home" else "agoal"
         m.push_event(f"{m.side(side).label} 득점")
-        self.last_board_goal = (side, time.time())
-        # 득점자: AI가 알려 준 선수 (스코어보드보다 해설 판단이 먼저 왔으면 그걸 씀)
-        ps = self.pending_scorer
-        if scorer is None and ps and time.time() - ps[2] < 30 and ps[0] in (None, side):
-            scorer = ps[1]
-        if scorer:
-            self.mark_scorer(side, scorer)
+        bg = {"side": side, "t": time.time(), "scorer": None}
+        self.last_board_goal = bg
+        # 골 장면·리플레이 동안엔 표시가 사라지니, 45초 안의 마지막 그 팀 선수
+        last = [h for h in self.hud_hist if h[1] == side and time.time() - h[0] < 45]
         self.refresh_overlay()
         self.bump_viewers()
         self.add_hype(3.0)
         self.update_state_line()
-        if ai_live:                                       # AI 채팅이 한 줄씩 오고 있음
-            self.enqueue(self.engine.goal(side, 4), 0.1, 3.0)
-        elif ai_msgs:
-            self.enqueue(self.engine.goal(side, 4) + ai_msgs)
-        elif ps and time.time() - ps[2] < 30:
-            self.enqueue(self.engine.goal(side, 5))      # AI 반응은 이미 나갔으니 조금만
+        recent_ai = time.time() - self.last_ai_goal_at < 40       # 해설 반응으로 골 채팅이 이미 나감
+        if recent_ai:
+            self.enqueue(self.engine.goal(side, 5))
         elif self.ai_ready():
             self.enqueue(self.engine.goal(side, 5))
-            self.ai_event(ev, text)
         else:
             self.enqueue(self.engine.goal(side, 16))
+        if last:
+            self.set_scorer(bg, last[-1][2], "골 직전 선수 표시")
+        if self.ai_ready() and not recent_ai:
+            self.ai_event(ev, text)
 
     def on_board(self, d):
         m = self.match
@@ -3418,6 +3736,7 @@ class App:
                 f"경기 시간: {str(m.minute) + '분' if m.minute is not None else '알 수 없음'}\n"
                 f"시청자 세력: {m.home.label} 팬 {sp['home']:.1f}%, {m.away.label} 팬 {sp['away']:.1f}%, 중립 {sp['neutral']:.1f}%"
                 + (f"\n참고: {kor}" if kor else "") +
+                + (f"\n지금 공을 가진 선수(화면 표시): {bh[1]} ({m.side(bh[0]).label})" if (bh := self.ball_holder()) else "") +
                 f"\n최근 사건: {' / '.join(m.events[-6:]) or '없음'}\n"
                 f"최근 중계 해설(음성 받아쓰기라 오타가 있을 수 있음):\n{recent}")
 
@@ -3429,7 +3748,9 @@ class App:
         if not self.ai_ready():
             return
         n = {"hgoal": 14, "agoal": 14}.get(ev, 8)
-        desc = {"hgoal": f"{self.match.home.label} 득점!", "agoal": f"{self.match.away.label} 득점!"}.get(ev, EV_DESC.get(ev, ev))
+        bg = self.last_board_goal
+        who = f" 득점자: {bg['scorer']}" if bg and bg.get("scorer") else ""
+        desc = {"hgoal": f"{self.match.home.label} 득점!{who}", "agoal": f"{self.match.away.label} 득점!{who}"}.get(ev, EV_DESC.get(ev, ev))
         sup = ("큰 장면이니 kind super(후원 채팅)를 1~2개 섞을 것. 후원은 주로 기뻐하는 쪽 팬이 보냄." if ev in ("hgoal", "agoal")
                else "kind super는 쓰지 말 것.")
         prompt = (f"너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 방금 장면에 시청자들이 반응하는 채팅 {n}개를 만들어.\n\n"
@@ -3446,8 +3767,6 @@ class App:
         self.aiw.submit(1, {"type": "chat", "prompt": prompt, "idle": True})
 
     def tick_flow(self):
-        if self.session_on and self.teams_known:
-            self.ensure_lineups()
         # 해설 반응이 한동안 없을 때(조용한 구간)만 AI가 경기 흐름 잡담을 만듦
         quiet = time.time() - self.last_react_at > 15
         if (self.session_on and self.live and quiet and time.time() - self.last_ai_flow > 18 and self.ai_ready()):
