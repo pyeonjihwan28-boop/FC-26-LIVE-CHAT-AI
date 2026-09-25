@@ -128,7 +128,7 @@ DEFAULT_CFG = {
     "language": "ko",                 # (예전 설정, 지금은 commentary_language를 씀)
     "commentary_language": "ko",      # 해설 언어 (FC 26 한국어 해설). auto = 알아서 찾기
     "neutral_pct": 33,
-    "speed": "normal",
+    "speed": "normal",                # (자동) 시청자 수로 정해지므로 메뉴에서 뺐음
     "font_scale": 1.0,
     "always_on_top": True,
     "chroma": False,
@@ -1581,7 +1581,11 @@ class ChatWindow:
         return max(1, int(round(n * self.k)))
 
     def fs(self) -> float:
-        return float(self.app.cfg.get("font_scale", 1.0))
+        return getattr(self, "_fs", 1.0)
+
+    def auto_font_scale(self, width: int) -> float:
+        """채팅 창 폭(기본 400px)에 비례해 글자 크기를 정함"""
+        return round(max(0.9, min(1.6, width / (400 * self.k))) * 20) / 20
 
     def build_fonts(self):
         s = self.fs()
@@ -1796,6 +1800,10 @@ class ChatWindow:
     def _on_resize(self, e):
         if abs(e.width - self._last_w) > 2:
             self._last_w = e.width
+            fs = self.auto_font_scale(self.root.winfo_width())
+            if abs(fs - self.fs()) >= 0.05:
+                self._fs = fs
+                self.root.after_idle(self.apply_theme)
             self._redraw_cards()
             self.lbl_trans.configure(wraplength=max(self.px(200), e.width - self.px(30)))
 
@@ -1967,70 +1975,23 @@ class ChatWindow:
 
     # ----- 메뉴 -----
     def build_menu(self):
+        """사람이 직접 해야 하는 것만 남김. 나머지(속도, 글자 크기, 명단 크기·배치, 중립 비율, OBS 초록 배경,
+        채팅·기록 지우기 등)는 App.auto_settings()와 경기 흐름에 따라 자동으로 정해짐."""
         cfg = self.app.cfg
         m = tk.Menu(self.root, tearoff=0, font=self.f["small"])
-        self.v_top = tk.BooleanVar(value=cfg.get("always_on_top", True))
-        self.v_chroma = tk.BooleanVar(value=cfg.get("chroma", False))
         self.v_trans = tk.BooleanVar(value=cfg.get("show_transcript", False))
-        self.v_viewers = tk.BooleanVar(value=cfg.get("show_viewers", True))
-        self.v_comp = tk.BooleanVar(value=cfg.get("show_composer", True))
-        self.v_lineup = tk.BooleanVar(value=cfg.get("lineup_visible", True))
-        self.v_ai = tk.BooleanVar(value=cfg.get("use_ai", True))
-        self.v_speed = tk.StringVar(value=cfg.get("speed", "normal"))
-        self.v_scale = tk.DoubleVar(value=cfg.get("font_scale", 1.0))
-        self.v_luscale = tk.DoubleVar(value=cfg.get("lineup_scale", 1.0))
-        self.v_neutral = tk.IntVar(value=int(cfg.get("neutral_pct", 33)))
-        self.v_layout = tk.StringVar(value=cfg.get("lineup_layout", "row"))
 
-        def setc(key, var, after=None):
-            def f():
-                cfg[key] = var.get()
-                save_cfg(cfg)
-                (after or self.apply_theme)()
-            return f
+        def toggle_trans():
+            cfg["show_transcript"] = self.v_trans.get()
+            save_cfg(cfg)
+            self.apply_theme()
 
-        def viewers_changed():
-            self.set_viewers(self.app.viewers)
-
-        m.add_command(label="킥오프 (채팅 시작)", command=self.app.kickoff)
-        m.add_command(label="채팅 멈추기 (킥오프 전으로)", command=self.app.pause_chat)
-        m.add_separator()
         m.add_command(label="선발 명단 설정…", command=self.app.open_lineup_editor)
         m.add_command(label="선수 기록 넣기 (골·카드·교체)…", command=self.app.open_mark_dialog)
-        m.add_checkbutton(label="선발 명단 화면에 띄우기", variable=self.v_lineup, command=setc("lineup_visible", self.v_lineup, self.app.refresh_overlay))
         m.add_command(label="팀 직접 정하기…", command=self.app.open_team_dialog)
-        m.add_command(label="팀 다시 찾기", command=self.app.redetect)
         m.add_separator()
-        m.add_checkbutton(label="AI로 채팅 만들기", variable=self.v_ai, command=setc("use_ai", self.v_ai, lambda: None))
-        sp = tk.Menu(m, tearoff=0, font=self.f["small"])
-        for k, lab in (("slow", "느림"), ("normal", "보통"), ("fast", "빠름")):
-            sp.add_radiobutton(label=lab, value=k, variable=self.v_speed, command=setc("speed", self.v_speed, lambda: None))
-        m.add_cascade(label="채팅 속도 (시청자 수에 맞춰 자동)", menu=sp)
-        nt = tk.Menu(m, tearoff=0, font=self.f["small"])
-        for v in (20, 33, 40, 50):
-            nt.add_radiobutton(label=f"{v}%", value=v, variable=self.v_neutral, command=setc("neutral_pct", self.v_neutral, self.app.on_split_changed))
-        m.add_cascade(label="중립 팬 비율", menu=nt)
+        m.add_checkbutton(label="해설 자막 보기", variable=self.v_trans, command=toggle_trans)
         m.add_separator()
-        fs = tk.Menu(m, tearoff=0, font=self.f["small"])
-        for v, lab in ((1.0, "보통"), (1.25, "크게"), (1.5, "아주 크게")):
-            fs.add_radiobutton(label=lab, value=v, variable=self.v_scale, command=setc("font_scale", self.v_scale))
-        m.add_cascade(label="채팅 글자 크기", menu=fs)
-        ls = tk.Menu(m, tearoff=0, font=self.f["small"])
-        for v, lab in ((0.8, "작게"), (1.0, "보통"), (1.25, "크게")):
-            ls.add_radiobutton(label=lab, value=v, variable=self.v_luscale, command=setc("lineup_scale", self.v_luscale, self.app.refresh_overlay))
-        m.add_cascade(label="선발 명단 크기", menu=ls)
-        lo = tk.Menu(m, tearoff=0, font=self.f["small"])
-        for v, lab in (("row", "가로로 나란히"), ("column", "세로로 쌓기")):
-            lo.add_radiobutton(label=lab, value=v, variable=self.v_layout, command=setc("lineup_layout", self.v_layout, self.app.refresh_overlay))
-        m.add_cascade(label="선발 명단 배치", menu=lo)
-        m.add_checkbutton(label="시청자 수 보이기", variable=self.v_viewers, command=setc("show_viewers", self.v_viewers, viewers_changed))
-        m.add_checkbutton(label="아래 입력창 보이기", variable=self.v_comp, command=setc("show_composer", self.v_comp))
-        m.add_checkbutton(label="항상 위에", variable=self.v_top, command=setc("always_on_top", self.v_top))
-        m.add_checkbutton(label="초록 배경 (OBS 크로마 키)", variable=self.v_chroma, command=setc("chroma", self.v_chroma))
-        m.add_checkbutton(label="해설 자막 보기", variable=self.v_trans, command=setc("show_transcript", self.v_trans))
-        m.add_separator()
-        m.add_command(label="채팅 지우기", command=self.clear)
-        m.add_command(label="경기 기록 지우기 (골·카드·교체 표시)", command=self.app.clear_marks)
         m.add_command(label="종료", command=self.app.quit)
         self.menu = m
 
@@ -2328,16 +2289,21 @@ class LineupOverlay:
     def render(self):
         cv = self.cv
         cv.delete("all")
-        cfg = self.app.cfg
         keys = [k for k in ("home", "away") if self.app.match.lineup(k)]
-        if not cfg.get("lineup_visible", True) or not keys or not self.app.session_on:
+        if not keys or not self.app.session_on:
             self.win.withdraw()
             return
-        s = float(cfg.get("lineup_scale", 1.0)) * self.app.k
+        mon, _ = primary_monitor()
+        mw0 = mon["width"] if mon else self.app.root.winfo_screenwidth()
+        mh0 = mon["height"] if mon else self.app.root.winfo_screenheight()
+        # 크기: 1080p 화면 기준으로 해상도에 맞춰 (화면 배율도 반영)
+        k = self.app.k
+        s = max(0.8 * k, min(1.4 * k, mh0 / 1080))
         self.s = s
         W = int(280 * s)
         gap = int(12 * s)
-        column = cfg.get("lineup_layout", "row") == "column"
+        # 배치: 가로로 나란히 두면 화면 폭의 45%를 넘을 때만 세로로 쌓기
+        column = len(keys) > 1 and (len(keys) * W + gap) > mw0 * 0.45
         x = y = 0
         tw = th = 0
         for k in keys:
@@ -2555,6 +2521,8 @@ class App:
     def __init__(self, args):
         self.args = args
         self.cfg = load_cfg()
+        self.obs_on = False
+        self.auto_settings()
         load_learned()
         if IS_WIN:
             try:
@@ -2577,6 +2545,7 @@ class App:
         self.overlay = LineupOverlay(self)
         self.session_on = False
         self.live = False                  # 킥오프 버튼을 눌렀는지 (눌러야 채팅이 나옴)
+        self.kickoff_at = 0.0
         self.demo_fed = False
         self.stt: AudioSTT | None = None
         self.board: BoardWatcher | None = None
@@ -2601,6 +2570,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.after(100, self.poll)
         self.root.after(4000, self.tick_viewers)
+        self.root.after(1000, self.watch_obs)
         self.root.after(3000, self.tick_flow)
         if args.always or args.demo:
             self.root.after(300, self.start_session)
@@ -2671,13 +2641,51 @@ class App:
         self.overlay.render()
         self.root.withdraw()
 
+    # ----- 자동 설정 (메뉴에서 뺀 항목들) -----
+    def auto_settings(self):
+        c = self.cfg
+        c["use_ai"] = True            # AI가 없으면 LocalAI.available()이 알아서 내장 문장으로
+        c["speed"] = "normal"         # 속도는 시청자 수와 장면으로
+        c["always_on_top"] = True
+        c["show_viewers"] = True
+        c["show_composer"] = True
+        c["chroma"] = self.obs_on     # OBS가 켜져 있으면 초록 배경
+        c["neutral_pct"] = self.auto_neutral() if hasattr(self, "match") else 33
+
+    def auto_neutral(self) -> int:
+        """인기 팀끼리 붙으면 팬이 많아 중립이 적고, 작은 팀끼리면 중립이 많음"""
+        total = self.match.home.fans_or_default + self.match.away.fans_or_default   # 백만 명
+        return int(max(20, min(50, 45 - 8 * math.log10(max(1.0, total / 20)))))
+
+    def watch_obs(self):
+        def check():
+            on = False
+            try:
+                import psutil
+                for pr in psutil.process_iter(["name"]):
+                    n = (pr.info.get("name") or "").lower()
+                    if n.startswith("obs") or "streamlabs" in n:
+                        on = True
+                        break
+            except Exception:
+                pass
+            self.bus.put(("obs", on))
+        threading.Thread(target=check, daemon=True).start()
+        self.root.after(5000, self.watch_obs)
+
     # ----- 킥오프 -----
     def kickoff(self):
         if not self.session_on or self.live:
             return
         self.live = True
+        self.kickoff_at = time.time()
         log.info("kickoff pressed")
         self.chat.show_kickoff(False)
+        # 새 경기: 지난 채팅과 선수 기록은 자동으로 지움
+        self.chat.clear()
+        self.match.marks.clear()
+        self.match.events.clear()
+        self.refresh_overlay()
         self.last_seen["kickoff"] = time.time()      # 해설의 "킥오프"와 겹쳐서 두 번 반응하지 않게
         self.match.push_event("킥오프")
         self.add_hype(1.5)
@@ -2688,9 +2696,11 @@ class App:
             self.demo_fed = True
             self.root.after(2500, self.demo_feed)
 
-    def pause_chat(self):
+    def pause_chat(self, reason: str = ""):
+        """경기가 끝났거나 새 경기가 시작되면 자동으로 킥오프 전으로"""
         if not self.live:
             return
+        log.info("chat paused: %s", reason)
         self.live = False
         self.queue.clear()
         self.chat.show_kickoff(True)
@@ -2714,18 +2724,13 @@ class App:
         log.info("teams: %s vs %s", self.match.home.label, self.match.away.label)
 
     def on_split_changed(self):
+        self.cfg["neutral_pct"] = self.auto_neutral()
         self.engine.crowd.rebuild()
         floor = self.match.viewer_floor()
         if self.viewers < floor or self.viewers > floor * 1.6:
             self.viewers = int(floor * (1 + random.random() * 0.12))
         self.chat.set_viewers(self.viewers)
         self.update_state_line()
-
-    def redetect(self):
-        self.teams_known = False
-        self.teams_locked = False
-        if self.board:
-            self.board.last_ident = 0
 
     def resolve_code(self, code: str):
         cands = CODE_INDEX.get(code, [])
@@ -2860,6 +2865,12 @@ class App:
             self.on_ai_chats(data)
         elif kind == "ai_review":
             self.on_ai_review(data)
+        elif kind == "obs":
+            if data != self.obs_on:
+                self.obs_on = data
+                self.cfg["chroma"] = data
+                log.info("obs %s -> chroma %s", "on" if data else "off", data)
+                self.chat.apply_theme()
         elif kind == "ai_failed":
             job = data
             if job.get("fallback_ev"):
@@ -2957,6 +2968,9 @@ class App:
             self.bump_viewers()
         if ev == "end":
             self.enqueue(self.engine.burst("end", 6))
+            ko = self.kickoff_at
+            # 2분 뒤 킥오프 전으로 (그 사이 새 경기 킥오프를 눌렀으면 건드리지 않음)
+            self.root.after(120000, lambda: self.kickoff_at == ko and self.pause_chat("경기 종료"))
         else:
             self.enqueue(self.engine.burst(ev, 3))
         self.ai_event(ev, text)
@@ -2998,6 +3012,8 @@ class App:
     def on_board(self, d):
         m = self.match
         if d.get("minute") is not None:
+            if m.minute is not None and m.minute >= 60 and d["minute"] <= 3:
+                self.pause_chat("경기 시간이 처음으로 돌아감 (새 경기)")
             m.minute = d["minute"]
         if "codes" not in d:
             return
@@ -3008,6 +3024,8 @@ class App:
         codes, score = d["codes"], d["score"]
         prev = self.board_stable
         self.board_stable = key
+        if prev is not None and prev[0] != codes:
+            self.pause_chat("스코어보드의 팀이 바뀜 (새 경기)")
         if not self.teams_locked and (prev is None or prev[0] != codes):
             th, ta = self.resolve_code(codes[0]), self.resolve_code(codes[1])
             if not self.teams_known or prev is not None:
@@ -3196,10 +3214,6 @@ class App:
 
     def open_mark_dialog(self):
         MarkDialog(self)
-
-    def clear_marks(self):
-        self.match.marks.clear()
-        self.refresh_overlay()
 
     def quit(self):
         try:
