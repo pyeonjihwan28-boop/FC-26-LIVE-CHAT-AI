@@ -485,6 +485,16 @@ P.update({
     "ans_min": ["{min}분", "{min}분임", "지금 {min}분", "{min}분쯤"],
     "ans_score": ["{score}", "{score}임", "지금 {score}", "{home} {hs} {away} {as}"],
 })
+# 평소 잡담 더 (같은 문장이 너무 자주 돌지 않게)
+P["fan_idle"] += ["{t} 오늘 몸 가볍네", "{p} 폼 올라왔다", "{o} 오늘 왜 저럼 ㅋㅋ", "{t} 측면 공략 좋다", "이번 시즌 {t} 믿는다",
+                  "{t} 중원 장악했네", "{o} 역습만 조심하면 됨", "{p} 한 골 넣자", "{t} 패스 돌리는 거 봐", "{t} 오늘 이겨야 된다",
+                  "{o} 팬 여기 있냐 ㅋㅋ", "{t} 전방 압박 미쳤다", "{p} 오늘 MOM 간다", "{t} 경기력 좋은데", "이 흐름 좋다",
+                  "{o} 체력 떨어진 듯", "{t} 수비 라인 탄탄하네", "{p} 드리블 봐라", "{t} 세트피스 기대된다", "{o} 공격 별거 없음"]
+P["neu_idle"] += ["오늘 경기 템포 좋네", "누가 이길 것 같음?", "와 패스 깔끔하다", "양 팀 다 신중하네", "전술 싸움이네", "키퍼 오늘 바쁘겠다",
+                  "측면이 계속 뚫리네", "그래픽 좋다", "FC26 재밌네", "이거 커리어 모드임?", "슈팅 각 나왔는데", "크로스 좀 올려라",
+                  "오늘 날씨 좋아 보임 ㅋㅋ", "관중 분위기 좋다", "오늘 첫 골 누가 넣을까", "빌드업 느리다", "해설 텐션 좋네",
+                  "ㅎㅇ 방금 옴", "이 경기 무승부각", "공 점유 비슷하네", "저녁 먹으면서 보는 중", "화질 좋네"]
+P["kor_idle"] += ["{k} 오늘 한 골 가자", "{k} 볼 터치 부드럽다", "{k} 나올 때마다 기대됨", "역시 {k}", "{k} 패스 센스 봐"]
 QUESTIONS = {"몇 분임?": "ans_min", "스코어 몇 대 몇?": "ans_score", "지금 몇 대 몇임?": "ans_score"}
 P["neu_idle"].append("지금 몇 대 몇임?")
 
@@ -732,10 +742,13 @@ class ChatEngine:
         return self.crowd.pick(faction).name
 
     def choose(self, pool: list[str]) -> str:
-        """최근에 쓴 문장은 피해서 고름"""
-        fresh = [t for t in pool if t not in self.recent] or pool
+        """최근에 쓴 문장은 피해서 고름. 다 최근에 썼으면 가장 오래전에 쓴 것 중에서."""
+        fresh = [t for t in pool if t not in self.recent]
+        if not fresh:
+            last = {t: i for i, t in enumerate(self.recent)}
+            fresh = sorted(pool, key=lambda t: last.get(t, -1))[:max(1, len(pool) // 3)]
         t = random.choice(fresh)
-        self.recent = (self.recent + [t])[-45:]
+        self.recent = (self.recent + [t])[-120:]
         return t
 
     def fill(self, t: str, key: str = "home") -> str:
@@ -1527,7 +1540,7 @@ class ChatWindow:
         # 머리: "실시간 채팅 ▾"  ...  시청자 수  ⋮
         self.header = tk.Frame(r, bg=BG, height=self.px(48))
         self.header.pack_propagate(False)
-        self.lbl_title = tk.Label(self.header, text="실시간 채팅  ▾", bg=BG, fg=FG, font=self.f["title"], cursor="hand2")
+        self.lbl_title = tk.Label(self.header, text="실시간 채팅 · 미리보기  ▾" if app.args.demo else "실시간 채팅  ▾", bg=BG, fg=FG, font=self.f["title"], cursor="hand2")
         self.lbl_title.pack(side="left", padx=(self.px(16), 0))
         self.lbl_title.bind("<Button-1>", self.popup)
         self.btn_menu = tk.Label(self.header, text="⋮", bg=BG, fg=FG, font=self.f["title"], cursor="hand2", padx=self.px(12))
