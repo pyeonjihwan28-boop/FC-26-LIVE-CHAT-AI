@@ -1,0 +1,6 @@
+# 실행 중 생기는 파일
+fc26_chat.log
+fc26_chat.pid
+fc26_chat_config.json
+__pycache__/
+*.pyc
