@@ -120,7 +120,7 @@ KOREAN_DEFAULT = {
 DEFAULT_CFG = {
     "use_ai": True,
     "ollama_model": "gemma3:4b",
-    "ai_interval_sec": 20,
+    "ai_interval_sec": 10,
     "self_review": True,              # 채팅 기록을 AI에게 보내 어색한 문장·닉네임을 스스로 고치기
     "review_interval_sec": 120,
     "whisper_model": "auto",          # auto / tiny / base / small / medium / large-v3-turbo
@@ -321,7 +321,8 @@ DETECT = [
     ("corner", re.compile(r"(코너\s*킥|코너\s*플래그|corner)", re.I)),
     ("freekick", re.compile(r"(프리\s*킥|free[\s-]?kick)", re.I)),
 ]
-COOLDOWN = {"score": 25, "end": 60, "half": 60, "kickoff": 60, "red": 20, "penalty": 20}
+COOLDOWN = {"score": 25, "end": 60, "half": 60, "kickoff": 60, "red": 20, "penalty": 20,
+            "chance": 5, "shot": 5, "cross": 6, "dribble": 6, "foul": 6, "attack": 6, "injury": 15, "pass": 8, "keeper": 8}
 MINOR = {"corner", "freekick", "offside", "sub"}
 BIG = {"hgoal", "agoal", "end", "red", "penalty"}
 EV_DESC = {
@@ -330,6 +331,27 @@ EV_DESC = {
     "offside": "오프사이드", "corner": "코너킥", "freekick": "프리킥", "sub": "선수 교체",
     "kickoff": "킥오프", "half": "전반 종료, 하프타임", "end": "경기 종료", "score": "골이 나온 것 같음",
 }
+
+
+# 큰 장면이 아닌 평범한 해설에도 짧게 반응하는 장면들 (위에서부터 먼저)
+MOMENTS = [
+    ("chance", re.compile(r"(찬스|결정적|위험한|위험합니다|일\s*대\s*일|1\s*대\s*1|노마크|완벽한\s*기회)")),
+    ("shot", re.compile(r"(슈팅|슛|때립니다|때렸|때려|중거리|발리|감아\s*찹|강하게\s*찹)")),
+    ("cross", re.compile(r"(크로스|헤딩|헤더|머리로)")),
+    ("dribble", re.compile(r"(드리블|제칩니다|제쳤|제쳐|돌파|개인기|탈압박)")),
+    ("foul", re.compile(r"(파울|반칙|태클|넘어집니다|넘어졌|밀었|잡아당)")),
+    ("attack", re.compile(r"(역습|속공|카운터|빠르게\s*올라|전진합니다|쇄도)")),
+    ("injury", re.compile(r"(부상|쓰러|고통|치료|들것)")),
+    ("pass", re.compile(r"(스루\s*패스|킬\s*패스|침투\s*패스|롱\s*패스|원\s*터치|패스)")),
+    ("keeper", re.compile(r"(골키퍼|키퍼)")),
+]
+
+
+def detect_moment(text: str):
+    for mv, rx in MOMENTS:
+        if rx.search(text):
+            return mv
+    return None
 
 
 def detect_event(text: str):
@@ -468,6 +490,17 @@ P = {
     "neu_idle": ["점유율 좋네", "빌드업 깔끔하다", "압박 좋다", "중원 싸움 치열하다", "ㅋㅋㅋㅋ", "롱볼 너무 많음", "역습 조심", "몇 분임?",
                  "세트피스 기대", "ㅎㅇㅎㅇ", "방금 들어옴", "스코어 몇 대 몇?", "슈팅 좀 때리자", "난이도 뭐로 하세요?", "해설 목소리 좋다",
                  "중립 기어 박고 봅니다", "오늘 전술 뭐임", "양 팀 다 잘하네", "템포 빠르다", "이 경기 끝까지 본다"],
+    "chance": ["어어어", "찬스다!!", "제발 제발", "넣어라!!", "기회 왔다", "와 위험했다", "이거 들어가야지", "지금이야!!", "오 오 오"],
+    "shot": ["슈팅!", "때려!!", "오 각 좋았다", "좀 더 낮게 차지", "슛 좋다", "아 아깝다", "골문 쪽으로 좀", "파워 ㄷㄷ", "슛 타이밍 좋았는데"],
+    "cross": ["크로스 좋다", "머리만 갖다 대", "헤더 가자", "크로스 각 좋네", "아 머리에 안 맞네", "니어 니어"],
+    "dribble": ["드리블 미쳤다", "와 제치는 거 봐", "발기술 ㄷㄷ", "개인기 좋다", "하나 둘 다 제꼈다", "탈압박 봐라"],
+    "foul": ["파울이지 이건", "심판 뭐함", "휘슬 불어야지", "거칠다", "이게 파울이야?", "다이빙 아님?", "카드 줘라"],
+    "attack": ["역습 간다!!", "빠르다 빠르다", "달려라!!", "속공 좋다", "수비 몇 명임", "기회다 기회"],
+    "injury": ["괜찮나..", "부상 아니지?", "아 아프겠다", "제발 큰 부상 아니길", "일어나라"],
+    "pass": ["패스 좋다", "킬패스 ㄷㄷ", "스루패스 미쳤다", "시야 봐라", "원터치 패스 깔끔", "패스 길 봐"],
+    "keeper": ["키퍼 좋다", "잘 잡았다", "키퍼 안정감 있네", "키퍼 오늘 폼 좋음"],
+    "echo_player": ["{n} 좋다", "{n} 뭐하냐", "{n} 오늘 폼 좋네", "{n}!!", "{n} 가자", "역시 {n}", "{n} 믿는다", "{n} 잘한다"],
+    "echo_opp": ["{n} 막아라", "{n} 좀 막아", "{n} 왜 이렇게 잘함", "{n} 조심해", "{n} 또 너냐"],
     "echo_fan": ["{t} 공격 좋다", "{t} 좀 더 올라가자", "{t} 템포 좋네", "{t} 패스 미스 좀 줄이자", "{t} 흐름 탔다", "{o} 막아라!!"],
     "echo_kor": ["{k}!!!", "{k} 나왔다", "{k} 가자!!", "오 {k} 터치 좋다", "{k} 해설에 나왔다 ㅋㅋ"],
 }
@@ -751,17 +784,17 @@ class ChatEngine:
         self.recent = (self.recent + [t])[-120:]
         return t
 
-    def fill(self, t: str, key: str = "home") -> str:
+    def fill(self, t: str, key: str = "home", n: str | None = None) -> str:
         key = key if key in ("home", "away") else "home"
         players = self.m.lineup_names(key)[:11] or []
         kor = self.m.korean_names(key)
         # 채팅에서는 "맨체스터 유나이티드" 대신 "맨유"처럼 줄여 씀
         words = {"t": self.m.side(key).short, "o": self.m.side(self.m.other(key)).short,
                  "p": random.choice(players) if players else self.m.side(key).short,
-                 "k": random.choice(kor) if kor else "한국 선수"}
-        t = re.sub(r"\{([topk])\}(이|가|은|는|을|를|과|와)?(?![가-힣])",
+                 "k": random.choice(kor) if kor else "한국 선수", "n": n or ""}
+        t = re.sub(r"\{([topkn])\}(이|가|은|는|을|를|과|와)?(?![가-힣])",
                    lambda mm: words[mm.group(1)] + (josa(words[mm.group(1)], mm.group(2)) if mm.group(2) else ""), t)
-        t = re.sub(r"\{([topk])\}", lambda mm: words[mm.group(1)], t)
+        t = re.sub(r"\{([topkn])\}", lambda mm: words[mm.group(1)], t)
         return (t.replace("{min}", str(self.m.minute or ""))
                  .replace("{home}", self.m.home.short).replace("{away}", self.m.away.short)
                  .replace("{hs}", str(self.m.hs)).replace("{as}", str(self.m.as_))
@@ -864,16 +897,29 @@ class ChatEngine:
             out.append(self.msg(self.fill(t, f if f != "neutral" else "home"), f, tpl=t))
         return out
 
-    def echo(self, text: str) -> list[dict]:
-        """이벤트가 아닌 해설 문장에 가볍게 반응"""
+    def echo(self, text: str, moment: str | None = None) -> list[dict]:
+        """큰 장면이 아닌 해설 문장에 반응: 장면 종류(슈팅·드리블…)와 해설에 나온 선수 이름으로"""
         out = []
+        if moment:
+            for _ in range(random.randint(1, 3)):
+                f = self.pick_faction()
+                t = self.choose(P[moment])
+                out.append(self.msg(self.fill(t, f if f != "neutral" else "home"), f, tpl=t))
         for key in ("home", "away"):
             kor = self.m.korean_names(key)
-            if names_in_text(text, kor) and random.random() < 0.8:
+            if names_in_text(text, kor) and random.random() < 0.85:
                 for _ in range(random.randint(1, 3)):
                     out.append(self.say("echo_kor", key))
-            aliases = [self.m.side(key).name] + self.m.lineup_names(key)
-            if names_in_text(text, [a for a in aliases if a]) and random.random() < 0.35:
+            players = [p for p in names_in_text(text, self.m.lineup_names(key)) if p not in kor]
+            for p in players[:2]:
+                if random.random() < 0.75:
+                    t = self.choose(P["echo_player"])
+                    out.append(self.msg(self.fill(t, key, n=p), key, tpl=t))
+                if random.random() < 0.35:
+                    other = self.m.other(key)
+                    t = self.choose(P["echo_opp"])
+                    out.append(self.msg(self.fill(t, other, n=p), other, tpl=t))
+            if self.m.side(key).name and names_in_text(text, [self.m.side(key).name]) and random.random() < 0.5:
                 out.append(self.say("echo_fan", key))
         return out
 
@@ -1116,8 +1162,9 @@ class AudioSTT(threading.Thread):
     _size = ""
     _device = "cpu"
 
-    MAX_SEG = 9.0        # 쉬지 않고 이어지는 말은 이 길이에서 끊음 (초)
-    END_SIL = 0.45       # 이만큼 조용하면 한 문장이 끝난 것으로 봄 (초)
+    MAX_SEG = 5.0        # 쉬지 않고 이어지는 말은 이 길이에서 끊음 (초) — 짧을수록 빨리 뜸
+    END_SIL = 0.3        # 이만큼 조용하면 한 문장이 끝난 것으로 봄 (초)
+    MAX_LAG = 4.0        # 받아쓰기가 이만큼 밀리면 밀린 소리는 버리고 지금 소리부터 (실시간 유지)
 
     def __init__(self, cfg, bus: queue.Queue, prompt_fn):
         super().__init__(daemon=True, name="stt")
@@ -1145,7 +1192,7 @@ class AudioSTT(threading.Thread):
                 use_cuda = ctranslate2.get_cuda_device_count() > 0
             except Exception:
                 pass
-        threads = min(4, max(2, (os.cpu_count() or 4) // 3))
+        threads = min(6, max(2, (os.cpu_count() or 4) // 2))
         err = None
         for device in (["cuda", "cpu"] if use_cuda else ["cpu"]):
             compute = "int8_float16" if device == "cuda" else "int8"   # 게임과 그래픽 메모리를 나눠 쓰니 가볍게
@@ -1199,12 +1246,13 @@ class AudioSTT(threading.Thread):
         lang = self.lang
         # 힌트(앞 문맥·핫워드)는 한국어 해설일 때만. 다른 언어에 한국어 힌트를 주면 엉뚱하게 번역하듯 받아씀
         prompt, hot = self.prompt_fn() if lang == "ko" else ("", "")
-        beam = 5 if self._device == "cuda" else 3
+        beam = 5 if self._device == "cuda" else 1      # CPU는 빠르게(한 번에 하나만 추측)
         kw = dict(language=lang, beam_size=beam, vad_filter=not vad_done, condition_on_previous_text=False,
                   initial_prompt=prompt or None, temperature=0.0, no_speech_threshold=0.5, log_prob_threshold=-0.8,
                   compression_ratio_threshold=2.2, without_timestamps=True)
         if hot and not self.no_hotwords:
             kw["hotwords"] = hot
+        t0 = time.time()
         try:
             try:
                 segs, info = model.transcribe(piece, **kw)
@@ -1235,8 +1283,11 @@ class AudioSTT(threading.Thread):
                 continue
             parts.append(s.text.strip())
         text = clean_transcript(" ".join(parts), prompt)
+        took = time.time() - t0
+        if took > len(piece) / SR:
+            log.warning("stt slower than real time: %.1fs audio took %.1fs", len(piece) / SR, took)
         if text:
-            log.info("stt[%s]: %s", lang or getattr(info, "language", "?"), text)
+            log.info("stt[%s] %.1fs/%.1fs: %s", lang or getattr(info, "language", "?"), took, len(piece) / SR, text)
             self.bus.put(("text", text))
 
     def vote_language(self, info):
@@ -1331,6 +1382,9 @@ class AudioSTT(threading.Thread):
                 piece, buf = buf[start:cut], buf[cut:]
                 if len(piece) >= int(0.4 * SR):
                     self.transcribe(piece, vad_done=True)
+                if len(buf) > int(self.MAX_LAG * SR):       # 받아쓰는 동안 쌓인 소리가 너무 많으면 최근 것만
+                    log.info("stt lag %.1fs, skipping old audio", len(buf) / SR)
+                    buf = buf[-int(1.5 * SR):]
         except Exception as e:
             log.exception("audio loop failed")
             self.bus.put(("stt_status", ("error", f"게임 소리를 가져오지 못했습니다: {e}")))
@@ -2659,6 +2713,7 @@ class App:
         c = self.cfg
         c["use_ai"] = True            # AI가 없으면 LocalAI.available()이 알아서 내장 문장으로
         c["speed"] = "normal"         # 속도는 시청자 수와 장면으로
+        c["ai_interval_sec"] = min(10, int(c.get("ai_interval_sec", 10)))
         c["always_on_top"] = True
         c["show_viewers"] = True
         c["show_composer"] = True
@@ -2921,7 +2976,12 @@ class App:
         if ev and self.cooldown_ok(ev):
             self.fire(ev, text)
         else:
-            self.enqueue(self.engine.echo(text))
+            mv = detect_moment(text)
+            if mv and not self.cooldown_ok(mv):
+                mv = None
+            if mv:
+                self.add_hype(0.4)
+            self.enqueue(self.engine.echo(text, mv), 0.3, 3.5)     # 해설 반응은 빨리
 
     def apply_marks(self, ev, text):
         """해설 속 선수 이름으로 선발 명단에 카드·교체 표시 (채팅 반응 쿨다운과 상관없이)"""
@@ -2973,19 +3033,19 @@ class App:
                 self.ai_event("score", text)
             return
         if ev in MINOR:
-            self.enqueue(self.engine.burst(ev, random.randint(3, 4)))
+            self.enqueue(self.engine.burst(ev, random.randint(3, 4)), 0.3, 4.0)
             m.push_event(EV_DESC[ev])
             return
         m.push_event(EV_DESC.get(ev, ev))
         if ev in BIG:
             self.bump_viewers()
         if ev == "end":
-            self.enqueue(self.engine.burst("end", 6))
+            self.enqueue(self.engine.burst("end", 6), 0.3, 5.0)
             ko = self.kickoff_at
             # 2분 뒤 킥오프 전으로 (그 사이 새 경기 킥오프를 눌렀으면 건드리지 않음)
             self.root.after(120000, lambda: self.kickoff_at == ko and self.pause_chat("경기 종료"))
         else:
-            self.enqueue(self.engine.burst(ev, 3))
+            self.enqueue(self.engine.burst(ev, random.randint(3, 5)), 0.3, 4.0)
         self.ai_event(ev, text)
         if ev in ("kickoff", "half"):
             self.request_idle_pool()
