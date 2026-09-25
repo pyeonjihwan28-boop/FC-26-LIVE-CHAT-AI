@@ -136,7 +136,7 @@ DEFAULT_CFG = {
     "lineup_visible": True,
     "lineup_scale": 1.0,
     "lineup_layout": "row",           # row = 가로로 나란히, column = 세로로 쌓기
-    "scoreboard_region": [0.0, 0.0, 0.5, 0.16],   # 화면 비율 (왼쪽, 위, 폭, 높이)
+    "scoreboard_region": [0.0, 0.0, 0.5, 0.2],   # 화면 비율 (왼쪽, 위, 폭, 높이)
     "korean_players": KOREAN_DEFAULT,
     "lineups": {},
 }
@@ -1264,6 +1264,8 @@ class AudioSTT(threading.Thread):
 # ---------------------------------------------------------------------------
 SCORE_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,3})\s+(\d{1,2})\s*[-–—:|]?\s*(\d{1,2})\s+([A-Z][A-Z0-9]{1,3})\b")
 CLOCK_RE = re.compile(r"(\d{1,3})\s*[:：]\s*(\d{2})")
+# 라리가처럼 팀이 위아래로 쌓인 스코어보드: "VIL 0 / BAR 0"
+STACK_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,3})\s+(\d{1,2})\s+([A-Z][A-Z0-9]{1,3})\s+(\d{1,2})\b")
 
 
 def parse_board(items: list[tuple[float, float, str]]):
@@ -1275,11 +1277,19 @@ def parse_board(items: list[tuple[float, float, str]]):
     clock = CLOCK_RE.search(joined)
     minute = int(clock.group(1)) if clock else None
     rest = CLOCK_RE.sub(" ", joined)
+    rest = re.sub(r"\b[OQD]\b", "0", rest)              # 숫자 0을 글자 O로 읽는 경우
     m = SCORE_RE.search(rest)
     if not m:
         spaced = re.sub(r"(?<=[A-Z])(?=\d)|(?<=\d)(?=[A-Z])", " ", rest)
         spaced = re.sub(r"(\d)\s*[-–—:|]\s*(\d)", r"\1 - \2", spaced)
         m = SCORE_RE.search(spaced)
+        if not m:
+            st = STACK_RE.search(spaced)
+            if st:
+                h, hs, a, as_ = st.group(1), int(st.group(2)), st.group(3), int(st.group(4))
+                if hs > 20 or as_ > 20 or h == a:
+                    return {"minute": minute} if minute is not None else None
+                return {"codes": (h, a), "score": (hs, as_), "minute": minute}
     if not m:
         return {"minute": minute} if minute is not None else None
     h, hs, as_, a = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
