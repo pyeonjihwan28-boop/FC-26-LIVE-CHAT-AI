@@ -37,6 +37,7 @@ APP_DIR = Path(__file__).resolve().parent
 CFG_PATH = APP_DIR / "fc26_chat_config.json"
 LOG_PATH = APP_DIR / "fc26_chat.log"
 PID_PATH = APP_DIR / "fc26_chat.pid"
+LEARN_PATH = APP_DIR / "fc26_chat_learned.json"   # AI가 채팅 기록을 보고 스스로 보완한 문장·닉네임
 IS_WIN = sys.platform.startswith("win")
 
 logging.basicConfig(
@@ -120,6 +121,8 @@ DEFAULT_CFG = {
     "use_ai": True,
     "ollama_model": "gemma3:4b",
     "ai_interval_sec": 20,
+    "self_review": True,              # 채팅 기록을 AI에게 보내 어색한 문장·닉네임을 스스로 고치기
+    "review_interval_sec": 120,
     "whisper_model": "auto",          # auto / tiny / base / small / medium
     "language": "ko",                 # ko = 한국어 해설, en = 영어 해설
     "neutral_pct": 33,
@@ -297,22 +300,23 @@ class Match:
 # ---------------------------------------------------------------------------
 # 해설 속 장면 감지
 # ---------------------------------------------------------------------------
-NOT_SCORE = re.compile(r"(득점\s*(기회|찬스|없이|실패|을?\s*노|하지\s*못|에\s*실패)|넣었어야|넣지\s*못)")
+NOT_SCORE = re.compile(r"(득점\s*(기회|찬스|없이|실패|을?\s*노|하지\s*못|에\s*실패|권)|넣었어야|넣지\s*못|실점\s*위기|골\s*찬스|골\s*기회|옆\s*그물)")
 DETECT = [
-    ("end", re.compile(r"(경기\s*(가|는)?\s*(종료|끝)|종료\s*휘슬|full[\s-]?time|final whistle)", re.I)),
+    ("end", re.compile(r"(경기\s*(가|는)?\s*(종료|끝)|종료\s*휘슬|모든\s*경기가\s*끝|full[\s-]?time|final whistle)", re.I)),
     ("half", re.compile(r"(전반\s*(전)?\s*(이|은)?\s*(종료|끝)|하프\s*타임|half[\s-]?time)", re.I)),
-    ("kickoff", re.compile(r"(킥\s*오프|경기\s*시작|후반\s*(전)?\s*시작|kick[\s-]?off|we('re| are) underway)", re.I)),
-    ("red", re.compile(r"(레드\s*카드|퇴장|red card|sent off|sending off)", re.I)),
-    ("score", re.compile(r"(득점|골망|넣었습니다|넣습니다|넣어요|넣었어요|골입니다|골이에요|(^|\s)골(\s|$|!|~)|\bgoal\b|scores|scored|back of the net)", re.I)),
-    ("penalty", re.compile(r"(페널티|\bpk\b|penalty)", re.I)),
-    ("post", re.compile(r"(골대|크로스바|골\s*포스트|woodwork|crossbar|the post|off the bar)", re.I)),
-    ("save", re.compile(r"(선방|막아냅니다|막아냈|막아요|막습니다|막아\s*냅|세이브|쳐\s*냅니다|\bsaves?\b|great stop|denied)", re.I)),
-    ("yellow", re.compile(r"(옐로\s*카드|경고|\byellow\b|booked)", re.I)),
-    ("var", re.compile(r"(\bvar\b|비디오\s*판독)", re.I)),
-    ("offside", re.compile(r"(오프사이드|offside)", re.I)),
-    ("miss", re.compile(r"(빗나갑니다|빗나가|벗어납니다|벗어나|놓칩니다|놓쳤|하늘로|아쉽습니다|넣었어야|\bwide\b|over the bar|misses|missed)", re.I)),
+    ("kickoff", re.compile(r"(킥\s*오프|경기\s*시작|후반\s*(전)?\s*(이|을)?\s*시작|kick[\s-]?off|we('re| are) underway)", re.I)),
+    ("red", re.compile(r"(레드\s*카드|퇴장|경고\s*누적|red card|sent off|sending off)", re.I)),
+    # 골이 취소되면 득점이 아니라 판정 장면
+    ("var", re.compile(r"(노\s*골(?!적)|골\s*(이|은)?\s*취소|득점\s*(이|은)?\s*(취소|인정되지)|\bvar\b|비디오\s*판독|disallowed|ruled out)", re.I)),
+    ("score", re.compile(r"(득점|골망|골\s*네트|그물을\s*(흔|가르|가릅|갈라)|골문을\s*(흔|가르|가릅|갈라)|골인|넣었습니다|넣습니다|넣어요|넣었어요|골입니다|골이에요|골이죠|골{2,}|(^|\s)골(\s|$|!|~)|\bgoal\b|scores|scored|back of the net)", re.I)),
+    ("penalty", re.compile(r"(페널티\s*킥|페널티\s*스팟|페널티를?\s*(선언|얻|줍|내줍|내주|찍)|\bpk\b|penalty\s*(kick|awarded|given|spot))", re.I)),
+    ("post", re.compile(r"(골대|골\s*포스트|크로스바|골\s*바|woodwork|crossbar|the post|off the bar)", re.I)),
+    ("save", re.compile(r"(선방|막아냅니다|막아냈|막아요|막습니다|막아\s*냅|잡아냅니다|잡아냈|쳐\s*냅니다|쳐냈|펀칭|세이브|\bsaves?\b|great stop|denied)", re.I)),
+    ("yellow", re.compile(r"(옐로\s*카드|경고|카드를\s*(꺼|받)|\byellow\b|booked)", re.I)),
+    ("offside", re.compile(r"(오프\s*사이드|offside)", re.I)),
+    ("miss", re.compile(r"(빗나갑니다|빗나가|벗어납니다|벗어나|놓칩니다|놓쳤|하늘로|옆\s*그물|넘어갑니다|아쉽습니다|넣었어야|\bwide\b|over the bar|misses|missed)", re.I)),
     ("sub", re.compile(r"(교체|substitut|comes on|coming off)", re.I)),
-    ("corner", re.compile(r"(코너\s*킥|corner)", re.I)),
+    ("corner", re.compile(r"(코너\s*킥|코너\s*플래그|corner)", re.I)),
     ("freekick", re.compile(r"(프리\s*킥|free[\s-]?kick)", re.I)),
 ]
 COOLDOWN = {"score": 25, "end": 60, "half": 60, "kickoff": 60, "red": 20, "penalty": 20}
@@ -343,6 +347,76 @@ def names_in_text(text: str, names: list[str]) -> list[str]:
         if any(len(p) >= 2 and p.lower() in low for p in parts):
             hits.append(n)
     return hits
+
+
+# ---------------------------------------------------------------------------
+# 받아쓰기가 틀린 선수·팀 이름 바로잡기 (자모 단위로 비슷한 이름을 찾음)
+# ---------------------------------------------------------------------------
+CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+JUNG = ["ㅏ", "ㅐ", "ㅑ", "ㅒ", "ㅓ", "ㅔ", "ㅕ", "ㅖ", "ㅗ", "ㅘ", "ㅙ", "ㅚ", "ㅛ", "ㅜ", "ㅝ", "ㅞ", "ㅟ", "ㅠ", "ㅡ", "ㅢ", "ㅣ"]
+JONG = ["", "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ", "ㄽ", "ㄾ", "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅄ", "ㅅ", "ㅆ",
+        "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
+HANGUL_WORD = re.compile(r"^[가-힣]+$")
+# 이름 뒤에 붙는 말 (긴 것부터)
+JOSA = sorted(["선수가", "선수는", "선수의", "선수를", "선수", "에게서", "으로부터", "에게", "에서", "으로", "까지", "부터", "처럼", "보다",
+               "한테", "께서", "이랑", "은", "는", "이", "가", "을", "를", "의", "에", "와", "과", "도", "로", "만", "랑"], key=len, reverse=True)
+# 이름과 비슷해도 고치면 안 되는 흔한 중계 단어
+COMMON_WORDS = {"선수", "경기", "골키퍼", "수비", "공격", "슈팅", "패스", "크로스", "코너", "프리킥", "전반", "후반", "주심", "심판", "관중",
+                "홈팀", "원정", "득점", "실점", "동점", "역전", "찬스", "기회", "상황", "지금", "오늘", "이번", "다시", "정말", "아주",
+                "그리고", "하지만", "그러나", "이건", "이게", "저게", "여기", "거기", "우리", "상대", "왼쪽", "오른쪽", "중앙", "측면"}
+
+
+def jamo(s: str) -> str:
+    out = []
+    for ch in s:
+        c = ord(ch) - 0xAC00
+        if 0 <= c < 11172:
+            out.append(CHO[c // 588] + JUNG[(c % 588) // 28] + JONG[c % 28])
+        else:
+            out.append(ch.lower())
+    return "".join(out)
+
+
+def split_josa(word: str) -> tuple[str, str]:
+    for j in JOSA:
+        if len(word) > len(j) + 1 and word.endswith(j):
+            return word[: -len(j)], word[-len(j):]
+    return word, ""
+
+
+def fix_names(text: str, vocab: list[str]) -> str:
+    """받아쓰기 결과에서 명단에 있는 이름과 비슷한 단어를 그 이름으로 바꿈 (예: 세스코 → 세슈코)"""
+    from difflib import SequenceMatcher
+    cands = {}
+    for v in vocab:
+        for part in [v, *v.split()]:
+            part = part.strip()
+            if 2 <= len(part) <= 8 and HANGUL_WORD.match(part):
+                cands[part] = jamo(part)
+    if not cands:
+        return text
+    out = []
+    for tok in text.split(" "):
+        m = re.match(r"^([가-힣]+)(.*)$", tok)
+        if not m:
+            out.append(tok)
+            continue
+        word, rest = m.group(1), m.group(2)
+        core, suf = split_josa(word)
+        if core in cands or word in cands or core in COMMON_WORDS or len(core) < 2:
+            out.append(tok)
+            continue
+        cj = jamo(core)
+        best, br = None, 0.0
+        for name, nj in cands.items():
+            if abs(len(name) - len(core)) > 1:
+                continue
+            r = SequenceMatcher(None, cj, nj).ratio()
+            if r > br:
+                best, br = name, r
+        need = 0.8 if len(core) <= 2 else 0.76
+        out.append(best + suf + rest if best and br >= need else tok)
+    return " ".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -384,15 +458,253 @@ P = {
     "echo_fan": ["{t} 공격 좋다", "{t} 좀 더 올라가자", "{t} 템포 좋네", "{t} 패스 미스 좀 줄이자", "{t} 흐름 탔다", "{o} 막아라!!"],
     "echo_kor": ["{k}!!!", "{k} 나왔다", "{k} 가자!!", "오 {k} 터치 좋다", "{k} 해설에 나왔다 ㅋㅋ"],
 }
-NA = ["새벽", "직관", "치킨", "국대", "역습", "중거리", "골문", "왼발", "오른발", "캡틴", "하늘", "주말", "퇴근길", "라인", "빌드업", "슈팅", "원정", "홈경기", "잔디", "축구"]
-NB = ["러버", "장인", "요정", "맨", "킹", "고수", "초보", "지킴이", "덕후", "축구단", "해설가", "감독", "팬", "보는사람", "중독자"]
-NE = ["goal_hunter", "fcfan", "nightkick", "offside_trap", "topbins", "tikitaka", "playmaker", "counter_atk", "cleansheet", "volley_king"]
-TAILS = ["", "", "", "", " ㅋㅋ", "!!", "~"]
+P.update({
+    "fan_lead": ["이대로만 가자", "{t} 오늘 잡았다", "{o} 팬들 조용하네 ㅋㅋ", "한 골 더!!", "추가골 가자", "오늘 편하게 본다", "{score} 좋다 좋아",
+                 "방심하지 말고", "클린시트 가자", "{o} 오늘 답 없네"],
+    "fan_trail": ["아직 시간 있다", "한 골만 넣자", "{t} 제발", "동점 가자", "공격 좀 올려라", "왜 슈팅을 안 때리냐", "교체 좀 해라",
+                  "이거 뒤집는다 무조건", "하 답답하다", "{p} 뭐하냐 오늘"],
+    "late_fan": ["추가시간 몇 분 줌?", "이제 버텨야 됨", "시간 끌기 들어가냐", "마지막 한 방", "심장 떨린다", "제발 끝나라", "집중 집중"],
+    "late_neu": ["추가시간 몇 분임?", "이제 진짜 얼마 안 남음", "막판 치열하다", "마지막까지 모른다", "누가 이길지 모르겠네"],
+    "blowout": ["오늘 한 팀만 뛰네", "스코어 {score} 실화냐", "이건 끝났다", "{o} 멘탈 나갔다 ㅋㅋ", "골 잔치네"],
+    "super_goal": ["{t} 골 기념!!", "{p} 사랑해요!!", "골 기념 후원 ㅋㅋ", "오늘 이기면 치킨 쏜다", "{t} 화이팅!!", "이 맛에 봅니다",
+                   "골 들어가자마자 후원함 ㅋㅋ", "{t} 오늘 우승각"],
+    "agree": ["ㄹㅇ", "ㅇㅈ", "ㄹㅇㅋㅋ", "인정", "ㅋㅋㅋㅋ 맞말", "이건 맞지", "ㄴㄴ 아님", "@{n} ㄹㅇ", "@{n} ㅋㅋㅋ", "@{n} ㄴㄴ"],
+    "ans_min": ["{min}분", "{min}분임", "지금 {min}분", "{min}분쯤"],
+    "ans_score": ["{score}", "{score}임", "지금 {score}", "{home} {hs} {away} {as}"],
+})
+QUESTIONS = {"몇 분임?": "ans_min", "스코어 몇 대 몇?": "ans_score", "지금 몇 대 몇임?": "ans_score"}
+P["neu_idle"].append("지금 몇 대 몇임?")
+
+# 닉네임 재료 — 실제 유튜브 채팅처럼 실명, 영문 이름, @핸들, 일상 닉네임, 채널 이름, 팀 팬 구호가 섞이게
+SURNAMES = [("김", "kim"), ("김", "kim"), ("김", "kim"), ("이", "lee"), ("이", "lee"), ("박", "park"), ("박", "park"), ("최", "choi"),
+            ("정", "jung"), ("강", "kang"), ("조", "cho"), ("윤", "yoon"), ("장", "jang"), ("임", "lim"), ("한", "han"), ("오", "oh"),
+            ("서", "seo"), ("신", "shin"), ("권", "kwon"), ("황", "hwang"), ("안", "ahn"), ("송", "song"), ("홍", "hong")]
+GIVENS = [("민준", "minjun"), ("서준", "seojun"), ("도윤", "doyoon"), ("예준", "yejun"), ("시우", "siwoo"), ("하준", "hajun"),
+          ("지호", "jiho"), ("주원", "juwon"), ("지훈", "jihoon"), ("준서", "junseo"), ("현우", "hyunwoo"), ("건우", "gunwoo"),
+          ("우진", "woojin"), ("민재", "minjae"), ("성민", "sungmin"), ("동현", "donghyun"), ("승우", "seungwoo"), ("재현", "jaehyun"),
+          ("민수", "minsu"), ("영호", "youngho"), ("상훈", "sanghoon"), ("태훈", "taehoon"), ("정우", "jungwoo"), ("진영", "jinyoung"),
+          ("서연", "seoyeon"), ("지우", "jiwoo"), ("하은", "haeun"), ("수아", "sua"), ("민서", "minseo"), ("지민", "jimin"),
+          ("예린", "yerin"), ("유나", "yuna"), ("수빈", "subin"), ("은지", "eunji")]
+CASUAL = ["감자", "고구마", "도토리", "밤톨", "초코", "뭉치", "하루", "콩이", "보리", "모찌", "호빵", "만두", "구름", "라떼", "두부",
+          "배고픈곰", "졸린고양이", "퇴근하고싶다", "월요병", "귤까먹는중", "야식러", "잠못드는밤", "치킨은반반", "그냥사람",
+          "지나가던행인", "눈팅만함", "새벽감성", "아무개", "무지개", "꿀벌", "햄찌", "펭귄", "다람쥐", "산책가자", "오늘도맑음",
+          "축구보는곰", "주말엔축구", "공차는고양이", "왼발잡이", "조기축구에이스", "벤치워머", "만년후보", "침대축구반대"]
+CASUAL_TAIL = ["", "", "", "", "", "맘", "아빠", "짱", "님", "이", "22", "99", "0", "123", "_"]
+CHANNEL = ["{w}TV", "{w}의 일상", "{w}로그", "{w} 채널", "{w}브이로그", "{g}네 집", "{w}게임", "{g}의 축구일기"]
+ENG_WORDS = ["sunny", "daily", "noname", "kkkk", "zzz", "happy", "blue", "moon", "lucky", "chill", "cozy", "gamer", "footy", "pitch",
+             "night", "coffee", "mango", "tiger", "panda"]
+FAN_TAGS = {"Manchester United": ["ggmu", "mufc", "redevil"], "Liverpool": ["ynwa", "lfc", "kopite"], "Arsenal": ["coyg", "gooner"],
+            "Tottenham Hotspur": ["coys", "spurs", "thfc"], "Real Madrid": ["halamadrid", "madridista"],
+            "FC Barcelona": ["viscabarca", "culer", "fcb"], "Chelsea": ["ktbffh", "cfc", "blues"], "Manchester City": ["mcfc", "citizen"],
+            "FC Bayern München": ["miasanmia", "fcbayern"], "Paris Saint-Germain": ["psg", "icicestparis"], "Juventus": ["juve", "finoallafine"],
+            "AC Milan": ["acmilan", "rossoneri"], "Inter": ["inter", "nerazzurri"], "Borussia Dortmund": ["bvb", "echteliebe"]}
+FAN_KO = ["{s}팬", "{s} {n}년차", "{s}만 봄", "{s}사랑", "{s}는 못참지", "찐{s}팬", "{s} 우승하자", "{s}의 봄", "{s}팬{d}"]
+
+
+def _digits() -> str:
+    return random.choice(["", "", str(random.randint(1, 99)), str(random.randint(80, 99)), str(random.randint(1990, 2008)),
+                          "%02d%02d" % (random.randint(1, 12), random.randint(1, 28))])
+
+
+LAUGH_RX = re.compile(r"ㅋ{2,}")
+
+
+# ---------------------------------------------------------------------------
+# 자가 보완: AI가 채팅 기록을 보고 고른 어색한 문장·닉네임은 빼고, 새로 만든 것은 보탬
+# ---------------------------------------------------------------------------
+POOL_DESC = {
+    "celeb": "응원하는 팀이 골을 넣었을 때 팬의 환호", "groan": "응원하는 팀이 실점했을 때 팬의 한숨·변명",
+    "ngoal": "중립 시청자가 골 장면을 보고", "save": "골키퍼 선방", "miss": "결정적인 슈팅을 놓침", "post": "슈팅이 골대를 맞음",
+    "penalty": "페널티킥 선언", "yellow": "경고 카드", "red": "퇴장", "var": "VAR·판정 논란", "offside": "오프사이드",
+    "corner": "코너킥", "freekick": "프리킥", "sub": "선수 교체", "half": "전반 종료", "end": "경기 종료", "kickoff": "킥오프",
+    "fan_idle": "평소 팬의 응원·신경전 잡담", "neu_idle": "평소 중립 시청자의 잡담", "fan_lead": "응원 팀이 이기고 있을 때",
+    "fan_trail": "응원 팀이 지고 있을 때", "late_fan": "경기 막판 팬", "win": "응원 팀이 이겼을 때", "lose": "응원 팀이 졌을 때",
+}
+LEARNED: dict = {"lines": {}, "names": [], "banned": [], "banned_names": []}
+_BASE_POOLS: dict = {}
+
+
+def load_learned():
+    try:
+        if LEARN_PATH.exists():
+            d = json.loads(LEARN_PATH.read_text(encoding="utf-8"))
+            for k in LEARNED:
+                if isinstance(d.get(k), type(LEARNED[k])):
+                    LEARNED[k] = d[k]
+    except Exception:
+        log.exception("learned load failed")
+    apply_learned()
+
+
+def save_learned():
+    if DEMO:
+        return
+    try:
+        LEARN_PATH.write_text(json.dumps(LEARNED, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        log.exception("learned save failed")
+
+
+def apply_learned():
+    """내장 문장 + 배운 문장 − 뺀 문장 으로 문장 목록을 다시 만듦 (목록이 너무 줄지는 않게)"""
+    if not _BASE_POOLS:
+        _BASE_POOLS.update({k: list(v) for k, v in P.items()})
+    banned = set(LEARNED["banned"])
+    for k, base in _BASE_POOLS.items():
+        merged = list(dict.fromkeys(base + LEARNED["lines"].get(k, [])))
+        kept = [t for t in merged if t not in banned]
+        P[k] = kept if len(kept) >= 4 else merged
+
+
+def valid_line(text: str) -> str | None:
+    t = clean_ai_text(text, "normal")
+    if not t or len(t) > 30:
+        return None
+    if re.search(r"\{(?![topk]\})", t) or "}" in t.replace("{t}", "").replace("{o}", "").replace("{p}", "").replace("{k}", ""):
+        return None                       # 모르는 {자리}는 안 됨
+    low = norm(t)
+    for team in TEAMS:                    # 특정 팀 이름을 박아 넣은 문장은 다른 경기에 못 쓰니 뺌
+        if any(len(norm(a)) >= 2 and norm(a) in low for a in [team["ko"], *team["alias"]]):
+            return None
+    return t
+
+
+def valid_name(name: str) -> str | None:
+    n = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not (2 <= len(n) <= 20) or re.search(r"[<>{}\[\]\n]|http|www\.", n):
+        return None
+    if n.count(" ") > 2 or FORMAL_RX.search(n):
+        return None
+    if any(norm(n) == norm(a) for t in TEAMS for a in [t["ko"], t["en"], *t["alias"]]):
+        return None                       # 팀 이름 그 자체는 닉네임으로 안 씀
+    return n
+
+
+JOSA_PAIRS = {"이": ("이", "가"), "가": ("이", "가"), "은": ("은", "는"), "는": ("은", "는"), "을": ("을", "를"), "를": ("을", "를"),
+              "과": ("과", "와"), "와": ("과", "와")}
+
+
+def josa(word: str, j: str) -> str:
+    """앞말 받침에 맞춰 조사 고르기 (리버풀가 → 리버풀이)"""
+    last = word.strip()[-1:] if word.strip() else ""
+    code = ord(last) - 0xAC00 if last else -1
+    if 0 <= code < 11172:
+        has_final = code % 28 != 0
+    else:
+        has_final = last.lower() in "lmnr0136789"   # 영문·숫자는 대충 발음으로
+    a, b = JOSA_PAIRS[j]
+    return a if has_final else b
+
+
+class Viewer:
+    """채팅에 계속 나오는 한 사람. 닉네임·멤버 여부·말버릇이 경기 내내 같음."""
+
+    def __init__(self, name: str, faction: str, kind: str):
+        self.name, self.faction, self.kind = name, faction, kind
+        self.weight = min(25.0, random.paretovariate(1.3))   # 몇몇 사람이 유독 많이 씀
+        self.laugh = random.choice([2, 3, 3, 4, 4, 5, 6, 8])
+        self.nospace = random.random() < 0.25
+        self.tail = random.choice(["", "", "", "", "", "ㅋㅋ", "!!", "~", "ㅎㅎ", "..", "ㅠ"])
+
+    def style(self, text: str, light: bool = False) -> str:
+        t = LAUGH_RX.sub(lambda _m: "ㅋ" * max(2, self.laugh + random.randint(-1, 2)), text)
+        if self.nospace and len(t) <= 16 and random.random() < 0.6:
+            t = t.replace(" ", "")
+        if light:
+            return t
+        if self.tail and random.random() < 0.35 and not t.endswith(("ㅋ", "!", "?", "~", "ㅠ", "ㅎ", ".")):
+            t += ("" if self.nospace or self.tail in ("!!", "~", "..") else " ") + self.tail
+        if t.endswith("?") and random.random() < 0.2:
+            t += "?"
+        elif t.endswith("!") and random.random() < 0.1:
+            t += "!" * random.randint(1, 3)
+        return t
+
+
+class Audience:
+    """시청자 무리. 세력 비율대로 사람을 만들고, 가끔 새 사람이 들어옴."""
+
+    def __init__(self, match: "Match"):
+        self.m = match
+        self.people: list[Viewer] = []
+        self.rebuild()
+
+    def make_name(self, faction: str) -> str:
+        learned = LEARNED["names"]
+        if learned and random.random() < min(0.4, len(learned) / 60):
+            n = random.choice(learned)
+            return n + (str(random.randint(1, 99)) if random.random() < 0.2 else "")
+        for _ in range(5):
+            n = self._make_name(faction)
+            if n not in LEARNED["banned_names"]:
+                return n
+        return n
+
+    def _make_name(self, faction: str) -> str:
+        side = self.m.side(faction) if faction in ("home", "away") else None
+        sk, se = random.choice(SURNAMES)
+        gk, ge = random.choice(GIVENS)
+        r = random.random()
+        if side is not None and side.name and r < 0.14:             # 응원 팀이 드러나는 이름
+            t = lookup_team(side.name)
+            tags = FAN_TAGS.get(t["en"]) if t else None
+            if tags and random.random() < 0.45:
+                tag = random.choice(tags)
+                return random.choice([tag + _digits(), f"@{tag}_{ge}", f"{ge}_{tag}", tag.upper() + _digits()])
+            return random.choice(FAN_KO).format(s=side.short.replace(" ", ""), n=random.randint(3, 25), d=random.randint(1, 99))
+        r = random.random()
+        if r < 0.20:                                                 # 실명
+            return sk + gk
+        if r < 0.32:                                                 # 영문 이름
+            name = random.choice([f"{ge.capitalize()} {se.capitalize()}", f"{se.capitalize()} {ge.capitalize()}", f"{ge} {se}"])
+            return name
+        if r < 0.55:                                                 # @핸들
+            return "@" + random.choice([
+                f"{ge}{_digits()}", f"{se}{ge}{_digits()}", f"{ge[0]}{ge[-1]}{se}{random.randint(1, 99)}", f"{ge}_{se}",
+                f"{ge}.{se}", f"{ge}__", f"{random.choice(ENG_WORDS)}_{ge}", f"{ge}{random.choice(ENG_WORDS)}",
+                "user-" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(10))])
+        if r < 0.80:                                                 # 일상 닉네임
+            return random.choice(CASUAL) + random.choice(CASUAL_TAIL)
+        if r < 0.90:                                                 # 채널 이름
+            return random.choice(CHANNEL).format(w=random.choice(CASUAL[:20] + [gk]), g=gk)
+        return random.choice(ENG_WORDS) + random.choice(["", "", "_", "."]) + random.choice(ENG_WORDS + [ge]) + _digits()
+
+    def new_person(self, faction: str, kind: str | None = None) -> Viewer:
+        if kind is None:
+            kind = "member" if random.random() < 0.1 else "normal"
+        v = Viewer(self.make_name(faction), faction, kind)
+        self.people.append(v)
+        if len(self.people) > 400:
+            self.people.pop(0)
+        return v
+
+    def rebuild(self):
+        self.people = []
+        sp = self.m.split()
+        for i in range(140):
+            r = random.random() * 100
+            f = "home" if r < sp["home"] else ("away" if r < sp["home"] + sp["away"] else "neutral")
+            self.new_person(f, "mod" if i < 2 else None)
+
+    def rename(self, old: str, new: str | None = None):
+        for v in self.people:
+            if v.name == old:
+                v.name = new or self.make_name(v.faction)
+
+    def pick(self, faction: str | None, exclude: str | None = None) -> Viewer:
+        if random.random() < 0.08 or not self.people:
+            return self.new_person(faction or "neutral")
+        pool = [v for v in self.people if (faction is None or v.faction == faction) and v.name != exclude]
+        if not pool:
+            return self.new_person(faction or "neutral")
+        return random.choices(pool, weights=[v.weight for v in pool])[0]
 
 
 class ChatEngine:
     def __init__(self, match: Match):
         self.m = match
+        self.crowd = Audience(match)
+        self.recent: list[str] = []
 
     def pick_faction(self) -> str:
         sp = self.m.split()
@@ -404,57 +716,100 @@ class ChatEngine:
         return "neutral"
 
     def nickname(self, faction: str | None = None) -> str:
-        if faction in ("home", "away") and self.m.side(faction).name and random.random() < 0.3:
-            short = self.m.side(faction).name.replace(" ", "")[:4]
-            return short + random.choice(["러버", "팬", "사랑", "만세", "영원히", "짱"]) + (str(random.randint(1, 99)) if random.random() < 0.5 else "")
-        if random.random() < 0.25:
-            return random.choice(NE) + (str(random.randint(1, 999)) if random.random() < 0.6 else "")
-        return random.choice(NA) + random.choice(NB) + (str(random.randint(1, 999)) if random.random() < 0.3 else "")
+        return self.crowd.pick(faction).name
+
+    def choose(self, pool: list[str]) -> str:
+        """최근에 쓴 문장은 피해서 고름"""
+        fresh = [t for t in pool if t not in self.recent] or pool
+        t = random.choice(fresh)
+        self.recent = (self.recent + [t])[-45:]
+        return t
 
     def fill(self, t: str, key: str = "home") -> str:
         key = key if key in ("home", "away") else "home"
         players = self.m.lineup_names(key)[:11] or []
         kor = self.m.korean_names(key)
-        return (t.replace("{t}", self.m.side(key).label)
-                 .replace("{o}", self.m.side(self.m.other(key)).label)
-                 .replace("{p}", random.choice(players) if players else self.m.side(key).label)
-                 .replace("{k}", random.choice(kor) if kor else "한국 선수")
+        # 채팅에서는 "맨체스터 유나이티드" 대신 "맨유"처럼 줄여 씀
+        words = {"t": self.m.side(key).short, "o": self.m.side(self.m.other(key)).short,
+                 "p": random.choice(players) if players else self.m.side(key).short,
+                 "k": random.choice(kor) if kor else "한국 선수"}
+        t = re.sub(r"\{([topk])\}(이|가|은|는|을|를|과|와)?(?![가-힣])",
+                   lambda mm: words[mm.group(1)] + (josa(words[mm.group(1)], mm.group(2)) if mm.group(2) else ""), t)
+        t = re.sub(r"\{([topk])\}", lambda mm: words[mm.group(1)], t)
+        return (t.replace("{min}", str(self.m.minute or ""))
+                 .replace("{home}", self.m.home.short).replace("{away}", self.m.away.short)
+                 .replace("{hs}", str(self.m.hs)).replace("{as}", str(self.m.as_))
                  .replace("{score}", f"{self.m.hs}:{self.m.as_}"))
 
-    def vary(self, s: str) -> str:
-        if random.random() < 0.35:
-            s += random.choice(TAILS)
-        if random.random() < 0.08 and s.endswith(("!", "ㅋ", "ㅠ")):
-            s += s[-1] * random.randint(1, 3)
-        return s
+    def msg(self, text: str, faction: str, kind: str | None = None, amount: int = 0, light: bool = False,
+            tpl: str | None = None) -> dict:
+        v = self.crowd.pick(faction if faction in ("home", "away", "neutral") else None)
+        if kind in ("super", "newmember"):
+            return {"name": v.name, "text": text, "kind": kind, "amount": amount, "side": v.faction, "tpl": tpl}
+        return {"name": v.name, "text": v.style(text, light), "kind": v.kind, "amount": 0, "side": v.faction, "tpl": tpl}
 
-    def msg(self, text: str, faction: str, kind: str | None = None, amount: int = 0) -> dict:
-        if kind is None:
-            r = random.random()
-            kind = "member" if r < 0.12 else ("mod" if r < 0.135 else "normal")
-        return {"name": self.nickname(faction), "text": text if kind == "super" else self.vary(text), "kind": kind, "amount": amount}
+    def say(self, pool_key: str, faction: str, key: str | None = None) -> dict:
+        t = self.choose(P[pool_key])
+        return self.msg(self.fill(t, key or faction), faction, tpl=t)
 
     def idle(self) -> dict:
+        m = self.m
         f = self.pick_faction()
+        late = (m.minute or 0) >= 80
+        r = random.random()
         if f == "neutral":
-            return self.msg(random.choice(P["neu_idle"]), f)
-        if self.m.has_korean(f) and random.random() < 0.45:
-            return self.msg(self.fill(random.choice(P["kor_idle"]), f), f)
-        return self.msg(self.fill(random.choice(P["fan_idle"]), f), f)
+            if late and r < 0.3:
+                return self.say("late_neu", f, "home")
+            if abs(m.hs - m.as_) >= 3 and r < 0.35:
+                return self.say("blowout", f, "home" if m.hs > m.as_ else "away")
+            return self.say("neu_idle", f, "home")
+        lead = (m.hs - m.as_) * (1 if f == "home" else -1)
+        if lead > 0 and r < 0.35:
+            return self.say("fan_lead", f)
+        if lead < 0 and r < 0.4:
+            return self.say("fan_trail", f)
+        if late and r < 0.5:
+            return self.say("late_fan", f)
+        if m.has_korean(f) and random.random() < 0.45:
+            return self.say("kor_idle", f)
+        return self.say("fan_idle", f)
+
+    def followups(self, msg: dict) -> list[tuple[float, dict]]:
+        """다른 사람이 답하거나 맞장구침 → [(몇 초 뒤, 메시지)]"""
+        if msg.get("kind") not in ("normal", "member", "mod"):
+            return []
+        text = msg.get("text", "")
+        for q, pool in QUESTIONS.items():
+            if text.startswith(q.rstrip("?")):
+                if pool == "ans_min" and self.m.minute is None:
+                    return []
+                if random.random() < 0.75:
+                    return [(random.uniform(2.0, 6.0), self.msg(self.fill(self.choose(P[pool])), self.pick_faction()))]
+                return []
+        if len(text) >= 5 and random.random() < 0.05:
+            f = msg.get("side") if random.random() < 0.6 else self.pick_faction()
+            v = self.crowd.pick(f, exclude=msg.get("name"))
+            reply = self.choose(P["agree"]).replace("{n}", msg.get("name", "").lstrip("@"))
+            return [(random.uniform(1.5, 5.0), {"name": v.name, "text": v.style(reply), "kind": v.kind, "amount": 0, "side": v.faction})]
+        return []
 
     def goal(self, scorer: str, n: int = 16) -> list[dict]:
         out = []
         for _ in range(n):
             f = self.pick_faction()
             if f == scorer:
-                out.append(self.msg(self.fill(random.choice(P["celeb"]), scorer), f))
+                out.append(self.say("celeb", f, scorer))
             elif f == "neutral":
-                out.append(self.msg(self.fill(random.choice(P["ngoal"]), scorer), f))
+                out.append(self.say("ngoal", f, scorer))
             else:
-                out.append(self.msg(self.fill(random.choice(P["groan"]), f), f))
-        out.insert(2, self.msg(self.fill("{t} 골 기념 후원합니다!!", scorer), scorer, "super", random.choice([2000, 5000, 10000, 20000, 50000])))
+                out.append(self.say("groan", f))
+        if random.random() < 0.75:
+            out.append(self.msg(self.fill(self.choose(P["super_goal"]), scorer), scorer, "super",
+                                random.choice([2000, 2000, 5000, 5000, 10000, 20000, 50000])))
         if random.random() < 0.5:
-            out.insert(5, {"name": self.nickname(scorer), "text": "", "kind": "newmember", "amount": 0})
+            v = self.crowd.pick(scorer)
+            v.kind = "member"      # 이 사람은 이제부터 멤버로 보임
+            out.append({"name": v.name, "text": "", "kind": "newmember", "amount": 0, "side": scorer})
         return out
 
     def burst(self, ev: str, n: int = 8) -> list[dict]:
@@ -468,18 +823,19 @@ class ChatEngine:
             for _ in range(n):
                 f = self.pick_faction()
                 if winner and f == winner:
-                    out.append(self.msg(self.fill(random.choice(P["win"]), f), f))
+                    out.append(self.say("win", f))
                 elif winner and f in ("home", "away"):
-                    out.append(self.msg(self.fill(random.choice(P["lose"]), f), f))
+                    out.append(self.say("lose", f))
                 else:
-                    out.append(self.msg(self.fill(random.choice(P["end"])), f))
-            out.insert(2, self.msg("오늘 경기 수고하셨습니다!", "neutral", "super", random.choice([2000, 5000, 10000])))
+                    out.append(self.say("end", f, "home"))
+            out.append(self.msg("오늘 경기 수고하셨습니다!", "neutral", "super", random.choice([2000, 5000, 10000])))
             return out
         pool = P.get(ev, P["neu_idle"])
         out = []
-        for t in random.sample(pool, min(n, len(pool))):
+        for _ in range(min(n, len(pool))):
             f = self.pick_faction()
-            out.append(self.msg(self.fill(t, f if f != "neutral" else "home"), f))
+            t = self.choose(pool)
+            out.append(self.msg(self.fill(t, f if f != "neutral" else "home"), f, tpl=t))
         return out
 
     def echo(self, text: str) -> list[dict]:
@@ -489,10 +845,10 @@ class ChatEngine:
             kor = self.m.korean_names(key)
             if names_in_text(text, kor) and random.random() < 0.8:
                 for _ in range(random.randint(1, 3)):
-                    out.append(self.msg(self.fill(random.choice(P["echo_kor"]), key), key))
+                    out.append(self.say("echo_kor", key))
             aliases = [self.m.side(key).name] + self.m.lineup_names(key)
             if names_in_text(text, [a for a in aliases if a]) and random.random() < 0.35:
-                out.append(self.msg(self.fill(random.choice(P["echo_fan"]), key), key))
+                out.append(self.say("echo_fan", key))
         return out
 
 
@@ -557,7 +913,7 @@ class LocalAI:
         if images:
             msg["images"] = images
         payload = {"model": self.model, "messages": [msg], "stream": False, "keep_alive": "30m",
-                   "format": schema, "options": {"temperature": 0.9, "num_predict": num_predict}}
+                   "format": schema, "options": {"temperature": 0.95, "top_p": 0.95, "repeat_penalty": 1.15, "num_predict": num_predict}}
         with self._lock:
             try:
                 r = self._req("/api/chat", payload, timeout=timeout)
@@ -583,6 +939,16 @@ class LocalAI:
         }
         return self._chat(prompt, schema)
 
+    def review(self, prompt: str) -> dict:
+        schema = {"type": "object", "properties": {
+            "bad_chat_ids": {"type": "array", "items": {"type": "integer"}},
+            "bad_name_ids": {"type": "array", "items": {"type": "integer"}},
+            "new_lines": {"type": "array", "items": {"type": "object", "properties": {
+                "pool": {"type": "string", "enum": list(POOL_DESC)}, "text": {"type": "string"}}, "required": ["pool", "text"]}},
+            "new_names": {"type": "array", "items": {"type": "string"}}},
+            "required": ["bad_chat_ids", "bad_name_ids", "new_lines", "new_names"]}
+        return self._chat(prompt, schema, num_predict=1400, timeout=150)
+
     def identify(self, jpeg_b64: str) -> dict:
         schema = {"type": "object", "properties": {
             "found": {"type": "boolean"}, "home": {"type": "string"}, "away": {"type": "string"},
@@ -596,12 +962,30 @@ class LocalAI:
 
 
 RULES = """채팅 규칙:
-- 시청자는 한국인. 한국 유튜브 라이브 채팅 말투: 반말, 짧게(대부분 20자 이내), ㅋㅋ ㄷㄷ ㅠㅠ 를 적당히.
+- 시청자는 한국인. 한국 유튜브 라이브 채팅 말투: 반말, 대부분 3~15자(길어도 25자), 띄어쓰기·맞춤법은 대충, 마침표는 거의 안 씀.
+- 말투 예: "와 이걸 넣네", "키퍼 뭐함ㅋㅋ", "ㄹㅇ 폼 미쳤다", "아 제발", "심판 뭐하냐", "몇대몇임?", "ㄷㄷ", "이건 PK지".
+- 쓰지 말 말투: "~습니다", "~입니다", "정말 멋진 골이에요!", 해설처럼 상황을 설명하는 문장, 이모지 남발, 해시태그, 따옴표.
+- 모두 같은 얘기를 하지 말고 섞을 것: 짧은 감탄, 선수 평가, 심판 탓, 농담, 질문, 딴소리, 다른 채팅에 대한 맞장구.
 - 작성자 세력(side)을 위 '시청자 세력' 비율대로 섞을 것. 팬은 자기 팀 편에서 반응(좋은 장면엔 환호, 상대 골엔 한숨·변명·신경전), 중립은 재미·분석 위주.
 - 해설 내용과 선수 이름에 실제로 반응할 것. 같은 문장 반복 금지.
 - 욕설, 비속어, 혐오 표현, 실존 인물 모욕 금지. 팬끼리 가벼운 신경전까지만.
-- 닉네임은 유튜브 시청자처럼 다양하게. 실존 인물 이름을 닉네임으로 쓰지 말 것.
-- kind는 대부분 normal, 가끔 member, 드물게 mod. amount는 super일 때만 1000~100000 원, 나머지는 0."""
+- name은 짧은 닉네임 아무거나. 실존 인물 이름 금지.
+- kind는 대부분 normal. amount는 super일 때만 1000~100000 원, 나머지는 0."""
+FORMAL_RX = re.compile(r"(습니다|습니까|ㅂ니다|입니다|여러분|#)")
+
+
+def clean_ai_text(text: str, kind: str) -> str | None:
+    """AI가 만든 채팅 중 어색한 것은 버리고, 끝의 마침표 같은 건 다듬음"""
+    t = re.sub(r"\s+", " ", str(text or "")).strip().strip('"“”\'「」')
+    if not t:
+        return None
+    if kind == "super":
+        return t[:120]
+    if FORMAL_RX.search(t) or len(t) > 40:
+        return None
+    if t.endswith(".") and not t.endswith(".."):
+        t = t[:-1]
+    return t
 
 
 class AIWorker(threading.Thread):
@@ -628,6 +1012,9 @@ class AIWorker(threading.Thread):
                 if job["type"] == "identify":
                     res = self.ai.identify(job["image"])
                     self.bus.put(("teams_ai", res))
+                elif job["type"] == "review":
+                    res = self.ai.review(job["prompt"])
+                    self.bus.put(("ai_review", {"job": job, "res": res}))
                 else:
                     res = self.ai.chats(job["prompt"])
                     self.bus.put(("ai_chats", {"job": job, "res": res}))
@@ -641,11 +1028,46 @@ class AIWorker(threading.Thread):
 # ---------------------------------------------------------------------------
 # 게임 소리 받아쓰기 (WASAPI 루프백 + faster-whisper)
 # ---------------------------------------------------------------------------
-HALLUCINATION = ["시청해 주셔서", "시청해주셔서", "구독과 좋아요", "구독 좋아요", "자막 제공", "자막by", "mbc 뉴스", "kbs 뉴스", "다음 영상에서"]
+HALLUCINATION = ["시청해 주셔서", "시청해주셔서", "구독과 좋아요", "구독 좋아요", "좋아요와 구독", "자막 제공", "자막by", "자막 by",
+                 "mbc 뉴스", "kbs 뉴스", "sbs 뉴스", "다음 영상에서", "영상 끝까지", "한글자막", "배달의민족", "ytn"]
+ONLY_FILLER = re.compile(r"^(감사합니다|고맙습니다|네|아|음|어|예|네네|안녕하세요)[.!?~ ]*$")
+SR = 16000
+
+
+def clean_transcript(text: str, prompt: str = "") -> str:
+    t = re.sub(r"\s+", " ", text).strip()
+    # "골 골 골 골 골" 처럼 같은 말이 끝없이 반복되면 두 번까지만
+    t = re.sub(r"(\S+(?:\s\S+){0,3}?)(?:\s\1){2,}", r"\1 \1", t)
+    low = t.lower().replace(" ", "")
+    if len(t) < 2 or ONLY_FILLER.match(t) or any(h.replace(" ", "") in low for h in HALLUCINATION):
+        return ""
+    # 힌트로 준 문장을 그대로 따라 쓴 것은 버림
+    if len(low) >= 6 and low in prompt.lower().replace(" ", ""):
+        return ""
+    return t
+
+
+def to_16k(a, rate: int):
+    import numpy as np
+    if rate == SR:
+        return a
+    if rate % SR == 0:                 # 48000 → 16000: 평균 내서 줄이면 잡음이 덜 섞임
+        f = rate // SR
+        n = len(a) // f * f
+        return a[:n].reshape(-1, f).mean(axis=1).astype(np.float32)
+    n = int(len(a) * SR / rate)
+    return np.interp(np.linspace(0, len(a), n, endpoint=False), np.arange(len(a)), a).astype(np.float32)
 
 
 class AudioSTT(threading.Thread):
+    """게임 소리에서 해설자 말소리만 골라(VAD) 문장 단위로 끊어서 받아씀.
+    예전처럼 5초씩 자르면 단어가 중간에 잘려 인식이 망가지므로, 말이 멈춘 곳에서 자름."""
     _model = None
+    _size = ""
+    _device = "cpu"
+
+    MAX_SEG = 9.0        # 쉬지 않고 이어지는 말은 이 길이에서 끊음 (초)
+    END_SIL = 0.45       # 이만큼 조용하면 한 문장이 끝난 것으로 봄 (초)
 
     def __init__(self, cfg, bus: queue.Queue, prompt_fn):
         super().__init__(daemon=True, name="stt")
@@ -653,6 +1075,8 @@ class AudioSTT(threading.Thread):
         self.stop_flag = threading.Event()
         self.chunks: list[bytes] = []
         self.lock = threading.Lock()
+        self.prev_text = ""
+        self.no_hotwords = False
 
     @classmethod
     def load_model(cls, cfg):
@@ -664,19 +1088,80 @@ class AudioSTT(threading.Thread):
         try:
             import ctranslate2
             if ctranslate2.get_cuda_device_count() > 0:
-                device, compute = "cuda", "float16"
+                device, compute = "cuda", "int8_float16"   # 게임과 그래픽 메모리를 나눠 쓰니 가볍게
         except Exception:
             pass
         if size == "auto":
-            size = "small" if device == "cuda" else "base"
-        log.info("loading whisper %s on %s", size, device)
-        cls._model = WhisperModel(size, device=device, compute_type=compute, cpu_threads=2)
-        return cls._model
+            # 한국어는 작은 모델에서 틀리는 게 많아서 가능한 한 큰 모델부터 시도
+            cands = ["large-v3-turbo", "small"] if device == "cuda" else ["small", "base"]
+        else:
+            cands = [size]
+        threads = min(4, max(2, (os.cpu_count() or 4) // 3))
+        err = None
+        for s in cands:
+            try:
+                log.info("loading whisper %s on %s", s, device)
+                cls._model = WhisperModel(s, device=device, compute_type=compute, cpu_threads=threads)
+                cls._size, cls._device = s, device
+                return cls._model
+            except Exception as e:
+                log.warning("whisper %s failed: %s", s, e)
+                err = e
+        raise err or RuntimeError("no whisper model")
 
     def _cb(self, in_data, frame_count, time_info, status):
         with self.lock:
             self.chunks.append(in_data)
         return (None, self._continue)
+
+    def _vad(self):
+        """말소리 구간 찾기 (faster-whisper 안의 Silero VAD). 없으면 None."""
+        try:
+            from faster_whisper.vad import VadOptions, get_speech_timestamps
+            opts = VadOptions(threshold=0.45, min_speech_duration_ms=200, min_silence_duration_ms=300, speech_pad_ms=150)
+            import numpy as np
+            get_speech_timestamps(np.zeros(SR, dtype=np.float32), opts)   # 한 번 돌려 봄
+            return lambda a: get_speech_timestamps(a, opts)
+        except Exception as e:
+            log.warning("vad unavailable, fixed chunks: %s", e)
+            return None
+
+    def transcribe(self, model, piece, vad_done: bool):
+        import numpy as np
+        peak = float(np.max(np.abs(piece))) if len(piece) else 0.0
+        if peak < 0.003:
+            return
+        piece = (piece * min(8.0, 0.9 / peak)).astype(np.float32)    # 작은 소리는 키움
+        prompt, hot = self.prompt_fn()
+        full_prompt = f"{prompt} {self.prev_text[-80:]}".strip()
+        beam = 5 if self._device == "cuda" else 3
+        kw = dict(language=self.cfg.get("language", "ko"), beam_size=beam, best_of=beam,
+                  vad_filter=not vad_done, condition_on_previous_text=False, initial_prompt=full_prompt,
+                  temperature=[0.0, 0.2, 0.4], no_speech_threshold=0.6, log_prob_threshold=-1.0,
+                  compression_ratio_threshold=2.2, without_timestamps=True)
+        if hot and not self.no_hotwords:
+            kw["hotwords"] = hot
+        try:
+            segs, _ = model.transcribe(piece, **kw)
+            segs = list(segs)
+        except TypeError:                       # 오래된 faster-whisper에는 hotwords가 없음
+            self.no_hotwords = True
+            kw.pop("hotwords", None)
+            segs, _ = model.transcribe(piece, **kw)
+            segs = list(segs)
+        parts = []
+        for s in segs:
+            if s.avg_logprob < -1.1:
+                continue
+            if s.no_speech_prob > 0.55 and s.avg_logprob < -0.6:
+                continue
+            if getattr(s, "compression_ratio", 1.0) > 2.4:
+                continue
+            parts.append(s.text.strip())
+        text = clean_transcript(" ".join(parts), full_prompt)
+        if text:
+            self.prev_text = text
+            self.bus.put(("text", text))
 
     def run(self):
         try:
@@ -693,6 +1178,7 @@ class AudioSTT(threading.Thread):
             log.exception("whisper load failed")
             self.bus.put(("stt_status", ("error", f"받아쓰기 모델을 불러오지 못했습니다: {e}")))
             return
+        vad = self._vad()
         p = pyaudio.PyAudio()
         stream = None
         try:
@@ -709,33 +1195,54 @@ class AudioSTT(threading.Thread):
                             input_device_index=dev["index"], frames_per_buffer=2048, stream_callback=self._cb)
             stream.start_stream()
             self.bus.put(("stt_status", ("on", "해설 듣는 중")))
+            log.info("stt on: model=%s device=%s vad=%s", self._size, self._device, vad is not None)
             buf = np.zeros(0, dtype=np.float32)
-            chunk_len = 5 * 16000
+            last_check = 0.0
             while not self.stop_flag.is_set():
-                time.sleep(0.25)
+                time.sleep(0.15)
                 with self.lock:
                     raw, self.chunks = b"".join(self.chunks), []
                 if raw:
                     a = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                    a = a.reshape(-1, ch).mean(axis=1)
-                    if rate != 16000:
-                        n = int(len(a) * 16000 / rate)
-                        a = np.interp(np.linspace(0, len(a), n, endpoint=False), np.arange(len(a)), a).astype(np.float32)
+                    a = a[: len(a) // ch * ch].reshape(-1, ch).mean(axis=1)
+                    a = to_16k(a, rate)
                     buf = np.concatenate([buf, a])
                     self.bus.put(("level", float(np.sqrt(np.mean(a * a))) if len(a) else 0.0))
-                if len(buf) >= chunk_len:
-                    piece, buf = buf[:chunk_len], buf[chunk_len:]
-                    if len(buf) > chunk_len * 2:          # 밀리면 오래된 소리는 버림
-                        buf = buf[-chunk_len:]
-                    if float(np.sqrt(np.mean(piece * piece))) < 0.004:
-                        continue
-                    segs, _ = model.transcribe(piece, language=self.cfg.get("language", "ko"), beam_size=1,
-                                               vad_filter=True, condition_on_previous_text=False,
-                                               initial_prompt=self.prompt_fn(), no_speech_threshold=0.6)
-                    text = " ".join(s.text.strip() for s in segs).strip()
-                    low = text.lower().replace(" ", "")
-                    if len(text) >= 2 and not any(h.replace(" ", "") in low for h in HALLUCINATION):
-                        self.bus.put(("text", text))
+                if len(buf) > 30 * SR:                      # 받아쓰기가 밀리면 오래된 소리는 버림
+                    buf = buf[-12 * SR:]
+                if vad is None:                             # VAD가 없으면 예전처럼 5초씩
+                    if len(buf) >= 5 * SR:
+                        piece, buf = buf[:5 * SR], buf[5 * SR:]
+                        self.transcribe(model, piece, vad_done=False)
+                    continue
+                if len(buf) < int(0.8 * SR) or time.time() - last_check < 0.35:
+                    continue
+                last_check = time.time()
+                spans = vad(buf)
+                if not spans:
+                    buf = buf[-int(0.5 * SR):]              # 말소리가 없으면 끝부분만 남김
+                    continue
+                start = max(0, spans[0]["start"] - int(0.15 * SR))
+                end = spans[-1]["end"]
+                silent_tail = len(buf) - end
+                cut = None
+                if silent_tail >= int(self.END_SIL * SR):   # 말이 멈춤 → 여기까지 한 덩어리
+                    cut = min(len(buf), end + int(0.15 * SR))
+                elif len(buf) - start >= int(self.MAX_SEG * SR):
+                    # 말이 길게 이어짐 → 3초 이후의 가장 마지막 쉼에서 끊음
+                    for s1, s2 in zip(reversed(spans[:-1]), reversed(spans[1:])):
+                        if s1["end"] - start >= 3 * SR:
+                            cut = (s1["end"] + s2["start"]) // 2
+                            break
+                    if cut is None:
+                        cut = start + int(self.MAX_SEG * SR)
+                if cut is None:
+                    if start > 0:                           # 말 시작 전의 소리는 버림
+                        buf = buf[start:]
+                    continue
+                piece, buf = buf[start:cut], buf[cut:]
+                if len(piece) >= int(0.4 * SR):
+                    self.transcribe(model, piece, vad_done=True)
         except Exception as e:
             log.exception("audio loop failed")
             self.bus.put(("stt_status", ("error", f"게임 소리를 가져오지 못했습니다: {e}")))
@@ -898,7 +1405,9 @@ FONT_CANDIDATES = [
     r"C:\Windows\Fonts\malgunbd.ttf", r"C:\Windows\Fonts\malgun.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", "/System/Library/Fonts/AppleSDGothicNeo.ttc",
 ]
-SPEED = {"slow": (2800, 5600, 700), "normal": (1400, 3200, 420), "fast": (550, 1500, 230)}
+# 채팅 속도: 시청자 수로 기본 속도를 정하고, 메뉴의 느림/보통/빠름은 거기에 곱함
+SPEED_MULT = {"slow": 0.55, "normal": 1.0, "fast": 1.7}
+KICK_RED, KICK_RED_HOVER = "#e62117", "#ff3b30"
 
 
 def pick_font(root, *names):
@@ -954,6 +1463,12 @@ class ChatWindow:
         self.jump = tk.Canvas(self.body, width=self.px(40), height=self.px(40), bg=BG, highlightthickness=0, cursor="hand2")
         self.jump.bind("<Button-1>", lambda e: self.scroll_end())
         self._jump_on = False
+        # 킥오프 버튼 (누르기 전에는 채팅이 나오지 않음)
+        self.kick = tk.Canvas(self.body, bg=BG, highlightthickness=0, cursor="hand2")
+        self.kick.bind("<Button-1>", lambda e: self.app.kickoff())
+        self.kick.bind("<Enter>", lambda e: self._draw_kickoff(True))
+        self.kick.bind("<Leave>", lambda e: self._draw_kickoff(False))
+        self._kick_on = False
         # 입력창 (보기용)
         self.composer = tk.Frame(r, bg=BG)
         self.build_composer()
@@ -1001,6 +1516,7 @@ class ChatWindow:
         mk("pbody", 15)
         mk("tick", 13, "bold")
         mk("input", 14)
+        mk("kick", 20, "bold")
 
     def layout(self):
         """보이는 부분을 순서대로 다시 배치"""
@@ -1040,6 +1556,7 @@ class ChatWindow:
         self.layout()
         self._redraw_cards(force=True)
         self._draw_jump()
+        self._draw_kickoff()
         try:
             self.root.attributes("-topmost", bool(self.app.cfg.get("always_on_top", True)))
         except tk.TclError:
@@ -1052,7 +1569,7 @@ class ChatWindow:
     def avatar(self, name: str, size: int, gap: int = 0):
         """동그란 프로필(이니셜). gap = 오른쪽 투명 여백(글자와 간격)."""
         color = AV_COLORS[sum(ord(c) * (i + 7) for i, c in enumerate(name)) % len(AV_COLORS)]
-        ch = name[:1] or "?"
+        ch = name.lstrip("@")[:1] or "?"
         key = (color, ch, size, gap)
         if key in self._img_cache:
             return self._img_cache[key]
@@ -1236,6 +1753,27 @@ class ChatWindow:
                 self._draw_tick(t)
         self.root.after(1000, self._tick_ticker)
 
+    # ----- 킥오프 버튼 -----
+    def show_kickoff(self, on: bool):
+        self._kick_on = on
+        if on:
+            self._draw_kickoff()
+            self.kick.place(relx=0.5, rely=0.45, anchor="center")
+            self.kick.tk.call("raise", self.kick._w)   # Canvas.lift는 도형용이라 창 자체를 올림
+        else:
+            self.kick.place_forget()
+
+    def _draw_kickoff(self, hover: bool = False):
+        c = self.kick
+        c.delete("all")
+        bg = CHROMA if self.app.cfg.get("chroma") else BG
+        W, H, bh = self.px(240), self.px(118), self.px(64)
+        c.configure(width=W, height=H, bg=bg)
+        self.rrect(c, 2, 2, W - 2, bh, bh / 2, fill=KICK_RED_HOVER if hover else KICK_RED, outline="")
+        c.create_text(W / 2, bh / 2 + 1, text="⚽  킥오프", font=self.f["kick"], fill="#ffffff")
+        c.create_text(W / 2, bh + self.px(26), text="경기가 시작되면 눌러 주세요\n누르면 채팅이 시작돼요",
+                      font=self.f["small"], fill="#ffffff" if bg == CHROMA else FG2, justify="center")
+
     # ----- 아래로 이동 버튼 -----
     def _draw_jump(self):
         c = self.jump
@@ -1369,6 +1907,9 @@ class ChatWindow:
         def viewers_changed():
             self.set_viewers(self.app.viewers)
 
+        m.add_command(label="킥오프 (채팅 시작)", command=self.app.kickoff)
+        m.add_command(label="채팅 멈추기 (킥오프 전으로)", command=self.app.pause_chat)
+        m.add_separator()
         m.add_command(label="선발 명단 설정…", command=self.app.open_lineup_editor)
         m.add_command(label="선수 기록 넣기 (골·카드·교체)…", command=self.app.open_mark_dialog)
         m.add_checkbutton(label="선발 명단 화면에 띄우기", variable=self.v_lineup, command=setc("lineup_visible", self.v_lineup, self.app.refresh_overlay))
@@ -1379,7 +1920,7 @@ class ChatWindow:
         sp = tk.Menu(m, tearoff=0, font=self.f["small"])
         for k, lab in (("slow", "느림"), ("normal", "보통"), ("fast", "빠름")):
             sp.add_radiobutton(label=lab, value=k, variable=self.v_speed, command=setc("speed", self.v_speed, lambda: None))
-        m.add_cascade(label="채팅 속도", menu=sp)
+        m.add_cascade(label="채팅 속도 (시청자 수에 맞춰 자동)", menu=sp)
         nt = tk.Menu(m, tearoff=0, font=self.f["small"])
         for v in (20, 33, 40, 50):
             nt.add_radiobutton(label=f"{v}%", value=v, variable=self.v_neutral, command=setc("neutral_pct", self.v_neutral, self.app.on_split_changed))
@@ -1929,6 +2470,7 @@ class App:
     def __init__(self, args):
         self.args = args
         self.cfg = load_cfg()
+        load_learned()
         if IS_WIN:
             try:
                 import ctypes
@@ -1949,9 +2491,16 @@ class App:
         self.chat = ChatWindow(self)
         self.overlay = LineupOverlay(self)
         self.session_on = False
+        self.live = False                  # 킥오프 버튼을 눌렀는지 (눌러야 채팅이 나옴)
+        self.demo_fed = False
         self.stt: AudioSTT | None = None
         self.board: BoardWatcher | None = None
-        self.queue: list[dict] = []
+        self.queue: list[tuple[float, dict]] = []   # (보여 줄 시각, 메시지) — 시각 순
+        self.hype = 0.0                    # 큰 장면 직후 채팅이 몰리는 정도 (시간이 지나면 줄어듦)
+        self.hype_t = time.time()
+        self.last_pool_req = 0.0
+        self.chat_log: list[dict] = []       # 화면에 나온 채팅 (자가 보완용)
+        self.last_review = time.time()
         self.viewers = 0
         self.last_seen: dict[str, float] = {}
         self.pending_goal_at = 0.0
@@ -1966,7 +2515,6 @@ class App:
         self.place_chat_window()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.after(100, self.poll)
-        self.root.after(1000, self.tick_idle)
         self.root.after(4000, self.tick_viewers)
         self.root.after(3000, self.tick_flow)
         if args.always or args.demo:
@@ -2017,11 +2565,15 @@ class App:
         self.chat.set_viewers(self.viewers)
         self.refresh_overlay()
         self.request_idle_pool()
+        self.live = False
+        self.chat.show_kickoff(True)
 
     def stop_session(self):
         if not self.session_on:
             return
         self.session_on = False
+        self.live = False
+        self.queue.clear()
         log.info("session stop")
         for th in (self.stt, self.board):
             if th:
@@ -2033,6 +2585,31 @@ class App:
         self.match.reset_for_new_match()
         self.overlay.render()
         self.root.withdraw()
+
+    # ----- 킥오프 -----
+    def kickoff(self):
+        if not self.session_on or self.live:
+            return
+        self.live = True
+        log.info("kickoff pressed")
+        self.chat.show_kickoff(False)
+        self.last_seen["kickoff"] = time.time()      # 해설의 "킥오프"와 겹쳐서 두 번 반응하지 않게
+        self.match.push_event("킥오프")
+        self.add_hype(1.5)
+        self.enqueue(self.engine.burst("kickoff", random.randint(5, 7)), 0.3, 5.0)
+        self.ai_event("kickoff", "")
+        self.update_state_line()
+        if self.args.demo and not self.demo_fed:
+            self.demo_fed = True
+            self.root.after(2500, self.demo_feed)
+
+    def pause_chat(self):
+        if not self.live:
+            return
+        self.live = False
+        self.queue.clear()
+        self.chat.show_kickoff(True)
+        log.info("chat paused")
 
     # ----- 팀 -----
     def set_team(self, key, name, fans=None, color=None, manual=False):
@@ -2052,6 +2629,7 @@ class App:
         log.info("teams: %s vs %s", self.match.home.label, self.match.away.label)
 
     def on_split_changed(self):
+        self.engine.crowd.rebuild()
         floor = self.match.viewer_floor()
         if self.viewers < floor or self.viewers > floor * 1.6:
             self.viewers = int(floor * (1 + random.random() * 0.12))
@@ -2080,20 +2658,83 @@ class App:
         sp = self.match.split()
         self.chat.set_state(f"● {self.match.score_text()}   ·   팬 {self.match.home.label} {sp['home']:.0f}% / 중립 {sp['neutral']:.0f}% / {self.match.away.label} {sp['away']:.0f}%")
 
-    def whisper_prompt(self) -> str:
+    def name_vocab(self) -> list[str]:
+        m = self.match
+        out = m.lineup_names("home") + m.lineup_names("away") + m.korean_names("home") + m.korean_names("away")
+        for key in ("home", "away"):
+            t = lookup_team(m.side(key).name) if m.side(key).name else None
+            out += [m.side(key).name] + ([a for a in t["alias"] if HANGUL_WORD.match(a.replace(" ", ""))] if t else [])
+        return [n for n in dict.fromkeys(out) if n]
+
+    def whisper_prompt(self) -> tuple[str, str]:
+        """(앞 문맥 힌트, 핫워드). 받아쓰기 스레드에서 부름."""
         m = self.match
         names = m.lineup_names("home")[:11] + m.lineup_names("away")[:11] + m.korean_names("home") + m.korean_names("away")
-        return f"축구 중계 해설. {m.home.label} 대 {m.away.label}. {', '.join(names)}. 골, 슈팅, 선방, 코너킥, 프리킥, 오프사이드, 경고, 퇴장."
+        names = list(dict.fromkeys(names))
+        teams = f"{m.home.label} 대 {m.away.label}" if m.home.name or m.away.name else "축구"
+        prompt = (f"{teams} 경기 중계입니다. " + (f"출전 선수는 {', '.join(names)}. " if names else "")
+                  + "슈팅, 골, 선방, 코너킥, 프리킥, 페널티킥, 오프사이드, 경고, 퇴장, 교체.")
+        hot = " ".join([m.home.name, m.away.name, *names]).strip()
+        return prompt, hot
 
     # ----- 메시지 처리 -----
-    def enqueue(self, msgs):
-        self.queue.extend(msgs)
+    def enqueue(self, msgs, lo: float = 0.4, hi: float = 7.0):
+        """반응마다 사람마다 다른 시간차를 줌: 짧은 외침은 바로, 긴 문장·후원은 조금 뒤에."""
+        if not self.live:
+            return
+        now = time.time()
+        for m in msgs:
+            if m["kind"] == "super":
+                d = random.uniform(2.5, 9.0)
+            elif m["kind"] == "newmember":
+                d = random.uniform(1.5, 8.0)
+            else:
+                d = lo + min(hi - lo, random.gammavariate(1.6, (hi - lo) / 5) + len(m.get("text", "")) * 0.06)
+            self.queue.append((now + d, m))
+        self.queue.sort(key=lambda q: q[0])
 
-    def drip(self):
-        if self.queue:
-            self.chat.add(self.queue.pop(0))
-        base = SPEED.get(self.cfg.get("speed", "normal"), SPEED["normal"])[2]
-        self.root.after(int(base * (0.35 + random.random() * 1.3)), self.drip)
+    def add_hype(self, v: float):
+        self.hype = min(4.0, self.cur_hype() + v)
+        self.hype_t = time.time()
+
+    def cur_hype(self) -> float:
+        return self.hype * math.exp(-(time.time() - self.hype_t) / 12.0)
+
+    def chat_rate(self) -> float:
+        """1초에 나오는 채팅 수. 시청자 1천 명 ≈ 0.3개, 3만 명 ≈ 1개, 30만 명 ≈ 2.2개, 100만 명 ≈ 3.3개."""
+        base = 0.3 * (max(200, self.viewers) / 1000) ** 0.35
+        mult = SPEED_MULT.get(self.cfg.get("speed", "normal"), 1.0)
+        return max(0.1, min(12.0, base * mult * (1 + self.cur_hype())))
+
+    def emit(self, m: dict):
+        self.chat.add(m)
+        if m["kind"] in ("normal", "member", "mod"):
+            self.chat_log = (self.chat_log + [m])[-60:]
+        now = time.time()
+        for d, f in self.engine.followups(m):
+            self.queue.append((now + d, f))
+        self.queue.sort(key=lambda q: q[0])
+
+    def next_idle(self) -> dict:
+        if self.idle_pool and random.random() < 0.45:
+            side, text = self.idle_pool.pop(random.randrange(len(self.idle_pool)))
+            if len(self.idle_pool) < 6:
+                self.request_idle_pool()
+            return self.engine.msg(text, side, light=True)
+        return self.engine.idle()
+
+    def tick_chat(self):
+        """채팅 한 줄씩 내보내기. 간격은 무작위(푸아송)라 몰렸다 뜸했다 함."""
+        if self.session_on and self.live:
+            now = time.time()
+            # 너무 늦어진 반응은 버림 (장면이 지나갔는데 뒤늦게 나오면 어색함)
+            self.queue = [q for q in self.queue if now - q[0] < 12 or q[1]["kind"] == "super"]
+            if self.queue and self.queue[0][0] <= now:
+                self.emit(self.queue.pop(0)[1])
+            elif not self.queue or random.random() < 0.25:
+                self.emit(self.next_idle())
+        gap = random.expovariate(self.chat_rate())
+        self.root.after(int(max(60, min(8000, gap * 1000))), self.tick_chat)
 
     def poll(self):
         try:
@@ -2133,6 +2774,8 @@ class App:
                 self.teams_changed()
         elif kind == "ai_chats":
             self.on_ai_chats(data)
+        elif kind == "ai_review":
+            self.on_ai_review(data)
         elif kind == "ai_failed":
             job = data
             if job.get("fallback_ev"):
@@ -2147,6 +2790,7 @@ class App:
 
     def on_commentary(self, text):
         m = self.match
+        text = fix_names(text, self.name_vocab())
         m.commentary.append((time.time(), text))
         m.commentary = m.commentary[-60:]
         self.chat.set_transcript(text)
@@ -2160,6 +2804,8 @@ class App:
                 self.set_team("home", top[0][0])
                 self.set_team("away", top[1][0])
                 self.teams_changed()
+        if not self.live:          # 킥오프 전에는 팀 찾기만 하고 채팅 반응은 안 함
+            return
         ev = detect_event(text)
         if ev:
             self.apply_marks(ev, text)
@@ -2197,12 +2843,14 @@ class App:
 
     def fire(self, ev, text=""):
         m = self.match
+        self.add_hype({"score": 1.5, "red": 2.5, "penalty": 2.0, "end": 2.0, "kickoff": 1.0, "half": 0.8,
+                       "save": 1.2, "miss": 1.0, "post": 1.3, "var": 1.0, "yellow": 0.6}.get(ev, 0.4))
         if ev == "score":
             has_ocr = self.board_stable is not None
             if has_ocr:
                 # 스코어보드가 확인해 줄 때까지 짧게 반응만
                 self.pending_goal_at = time.time()
-                self.enqueue([self.engine.msg(random.choice(P["hint"]), self.engine.pick_faction()) for _ in range(3)])
+                self.enqueue([self.engine.say("hint", self.engine.pick_faction(), "home") for _ in range(3)], 0.2, 2.5)
                 return
             # 스코어보드가 없으면 해설 속 이름으로 어느 팀인지 판단
             side = None
@@ -2212,7 +2860,7 @@ class App:
             if side in ("home", "away"):
                 self.goal(side, text)
             else:
-                self.enqueue(self.engine.burst("hint", 5))
+                self.enqueue(self.engine.burst("hint", 5), 0.2, 2.5)
                 self.ai_event("score", text)
             return
         if ev in MINOR:
@@ -2252,6 +2900,7 @@ class App:
                 m.mark(side, scorer, "on")
         self.refresh_overlay()
         self.bump_viewers()
+        self.add_hype(3.0)
         self.update_state_line()
         if ai_msgs:
             self.enqueue(self.engine.goal(side, 4) + ai_msgs)
@@ -2335,8 +2984,9 @@ class App:
         self.aiw.submit(0, {"type": "chat", "prompt": prompt, "ev": ev, "fallback_ev": ev if ev in ("hgoal", "agoal", "end") else None})
 
     def request_idle_pool(self):
-        if not self.ai_ready():
+        if not self.ai_ready() or time.time() - self.last_pool_req < 40:
             return
+        self.last_pool_req = time.time()
         prompt = (f"너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 특별한 사건이 없을 때 흘러가는 평범한 잡담 30개를 만들어. "
                   f"팬들의 응원·신경전, 중립 팬의 전술 이야기, 선수 이야기, 인사, 먹을 것, 예측 같은 주제. 골이나 실점 이야기는 하지 말 것.\n\n"
                   f"{self.context()}\n\n{RULES}\n- kind super는 쓰지 말 것.\n- scored는 none.")
@@ -2344,7 +2994,7 @@ class App:
 
     def tick_flow(self):
         n = len(self.match.commentary)
-        if (self.session_on and n > self.last_ai_comment_n and time.time() - self.last_ai_flow > self.cfg.get("ai_interval_sec", 20)
+        if (self.session_on and self.live and n > self.last_ai_comment_n and time.time() - self.last_ai_flow > self.cfg.get("ai_interval_sec", 20)
                 and self.ai_ready()):
             self.last_ai_flow = time.time()
             self.last_ai_comment_n = n
@@ -2353,46 +3003,98 @@ class App:
                       f"큰 사건이 없으면 경기 흐름, 선수, 해설이 한 말에 대한 가벼운 반응과 팬끼리의 신경전 위주로.\n\n"
                       f"{self.context()}\n\n{RULES}\n- kind super는 쓰지 말 것.\n- scored는 none.")
             self.aiw.submit(2, {"type": "chat", "prompt": prompt})
+        elif (self.session_on and self.live and self.cfg.get("self_review", True) and len(self.chat_log) >= 30
+              and time.time() - self.last_review > self.cfg.get("review_interval_sec", 120) and self.ai_ready()):
+            self.request_review()
         self.root.after(3000, self.tick_flow)
+
+    # ----- 자가 보완 -----
+    def request_review(self):
+        self.last_review = time.time()
+        log_rows = self.chat_log[-40:]
+        names = list(dict.fromkeys(m["name"] for m in log_rows))
+        chats = "\n".join(f"{i}. [{m['name']}] {m['text']}" for i, m in enumerate(log_rows))
+        name_list = "\n".join(f"{i}. {n}" for i, n in enumerate(names))
+        pools = "\n".join(f"- {k}: {v}" for k, v in POOL_DESC.items())
+        prompt = (
+            "너는 한국 유튜브 라이브 채팅을 아주 많이 본 검수자야. 아래는 축구 게임(FC 26) 방송에서 자동으로 만든 가짜 채팅 기록이야. "
+            "진짜 한국 시청자가 쓴 것처럼 보이게 다듬는 게 목표야.\n\n"
+            f"[채팅 기록]\n{chats}\n\n[닉네임 목록]\n{name_list}\n\n"
+            "할 일:\n"
+            "1. bad_chat_ids: 실제 채팅에서는 안 쓸 어색한 채팅 번호 (번역투, 기계적인 문장, 상황에 안 맞는 말, 너무 반복되는 말). 괜찮으면 빈 배열.\n"
+            "2. bad_name_ids: 실제 유튜브에서 안 보일 어색한 닉네임 번호 (억지 조합, 부자연스러운 단어 붙이기). 괜찮으면 빈 배열.\n"
+            "3. new_lines: 아래 상황별로 진짜 한국 라이브 채팅 같은 짧은 문장 12~20개. 팀 이름·선수 이름은 직접 쓰지 말고 "
+            "{t}(자기 팀), {o}(상대 팀), {p}(자기 팀 선수) 자리 표시로만. 기존 문장과 겹치지 않게.\n"
+            f"{pools}\n"
+            "4. new_names: 실제 한국 유튜브 시청자 같은 닉네임 10~15개 (실명 같은 이름, 영문 아이디, @핸들, 귀여운 별명, 채널 이름 등 골고루). "
+            "실존 유명인 이름 금지.\n\n"
+            "문장 말투: 반말, 3~15자, 마침표 없음, 존댓말·설명조·이모지 남발 금지. 욕설·비하 금지.")
+        self.aiw.submit(3, {"type": "review", "prompt": prompt, "rows": log_rows, "names": names})
+
+    def on_ai_review(self, data):
+        job, res = data["job"], data["res"]
+        rows, names = job["rows"], job["names"]
+        banned, renamed, added, new_names = [], [], 0, []
+        for i in res.get("bad_chat_ids", [])[:10]:
+            if isinstance(i, int) and 0 <= i < len(rows) and rows[i].get("tpl"):
+                banned.append(rows[i]["tpl"])
+        for n in res.get("new_names", [])[:20]:
+            v = valid_name(n)
+            if v and v not in LEARNED["names"] and v not in LEARNED["banned_names"]:
+                new_names.append(v)
+        for i in res.get("bad_name_ids", [])[:10]:
+            if isinstance(i, int) and 0 <= i < len(names):
+                old = names[i]
+                if old not in LEARNED["banned_names"]:
+                    LEARNED["banned_names"].append(old)
+                self.engine.crowd.rename(old, new_names.pop() if new_names else None)
+                renamed.append(old)
+        LEARNED["names"] = [n for n in LEARNED["names"] + new_names if n not in LEARNED["banned_names"]][-300:]
+        LEARNED["banned_names"] = LEARNED["banned_names"][-500:]
+        LEARNED["banned"] = list(dict.fromkeys(LEARNED["banned"] + banned))[-400:]
+        for item in res.get("new_lines", [])[:25]:
+            pool = item.get("pool") if isinstance(item, dict) else None
+            t = valid_line(item.get("text", "")) if pool in POOL_DESC else None
+            if t and t not in LEARNED["banned"] and t not in P.get(pool, []):
+                LEARNED["lines"].setdefault(pool, []).append(t)
+                LEARNED["lines"][pool] = LEARNED["lines"][pool][-60:]
+                added += 1
+        apply_learned()
+        save_learned()
+        log.info("self review: -%d lines, -%d names (%s), +%d lines, +%d names",
+                 len(banned), len(renamed), ", ".join(renamed), added, len(new_names))
 
     def on_ai_chats(self, data):
         job, res = data["job"], data["res"]
-        msgs = []
+        msgs, pool = [], []
         for c in res.get("chats", [])[:30]:
-            text = str(c.get("text", "")).strip()[:200]
+            kind = "super" if c.get("kind") == "super" else "normal"
+            text = clean_ai_text(c.get("text", ""), kind)
             if not text:
                 continue
-            kind = c.get("kind") if c.get("kind") in ("normal", "member", "mod", "super") else "normal"
-            amt = int(c.get("amount") or 0)
+            side = c.get("side") if c.get("side") in ("home", "away", "neutral") else self.engine.pick_faction()
             if kind == "super":
-                amt = min(500000, max(1000, amt or 5000))
+                try:
+                    amt = int(c.get("amount") or 0)
+                except (TypeError, ValueError):
+                    amt = 0
+                msgs.append(self.engine.msg(text, side, "super", min(500000, max(1000, amt or 5000))))
             else:
-                amt = 0
-            name = str(c.get("name", "")).strip()[:24] or self.engine.nickname(c.get("side"))
-            msgs.append({"name": name, "text": text, "kind": kind, "amount": amt})
+                # 이름·멤버 표시는 AI 말고 고정된 시청자 무리에서 (같은 사람이 계속 나오게)
+                msgs.append(self.engine.msg(text, side, light=True))
+                pool.append((side, text))
         if job.get("idle"):
-            if len(msgs) >= 8:
-                self.idle_pool = msgs
+            if len(pool) >= 8:
+                self.idle_pool = pool
             return
         if job.get("ev") == "score" and self.board_stable is None:
             sc = res.get("scored")
             if sc in ("home", "away"):
                 self.goal(sc, ai_msgs=msgs)
                 return
-        self.enqueue(msgs)
+        self.enqueue(msgs, 0.2, 6.0)
 
     # ----- 주기 작업 -----
-    def tick_idle(self):
-        lo, hi, _ = SPEED.get(self.cfg.get("speed", "normal"), SPEED["normal"])
-        if self.session_on and not self.queue:
-            if self.idle_pool and random.random() < 0.6:
-                mm = dict(random.choice(self.idle_pool))
-                mm["name"] = self.engine.nickname(self.engine.pick_faction()) if random.random() < 0.5 else mm["name"]
-                self.chat.add(mm)
-            else:
-                self.chat.add(self.engine.idle())
-        self.root.after(int(lo + random.random() * (hi - lo)), self.tick_idle)
-
     def tick_viewers(self):
         if self.session_on:
             floor = self.match.viewer_floor()
@@ -2424,7 +3126,7 @@ class App:
             self.root.destroy()
 
     def run(self):
-        self.drip()
+        self.tick_chat()
         self.root.mainloop()
 
     # ----- 시험용 -----
@@ -2443,13 +3145,15 @@ class App:
             {"no": "7", "name": "밀러"}, {"no": "10", "name": "벨루미"}, {"no": "9", "name": "맥버니"}],
             "bench": [{"no": "6", "name": "아자이"}, {"no": "32", "name": "멘디"}, {"no": "11", "name": "그린"}]})
         self.refresh_overlay()
-        lines = ["경기 시작합니다 킥오프", "크룩스 경고를 받습니다", "세슈코 빠지고 교체", "래시포드 교체되어 나갑니다",
+
+    def demo_feed(self):
+        lines = [ "크룩스 경고를 받습니다", "세슈코 빠지고 교체", "래시포드 교체되어 나갑니다",
                  "마이누 교체", "드라메 나오고 아자이 교체 투입", "맥네어 대신 멘디 교체", "헤링턴 교체",
                  "아자이 골입니다!", "골키퍼가 막아냅니다", "코너킥 얻어냅니다", "양 팀 치열합니다", "프리킥 기회",
                  "헐 시티 역습", "멘디 골입니다!"]
 
         def feed(i=0):
-            if i < len(lines):
+            if i < len(lines) and self.live:
                 self.on_commentary(lines[i])
                 self.root.after(4500, feed, i + 1)
         feed()
