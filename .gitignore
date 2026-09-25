@@ -5,3 +5,5 @@ fc26_chat_config.json
 fc26_chat_learned.json
 __pycache__/
 *.pyc
+clips/
+transcripts/

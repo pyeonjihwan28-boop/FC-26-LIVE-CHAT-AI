@@ -5,3 +5,4 @@ mss
 PyAudioWPatch
 faster-whisper
 rapidocr_onnxruntime
+anthropic

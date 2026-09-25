@@ -4,7 +4,9 @@
 FC 26 라이브 채팅
 - FC 26이 켜지면 자동으로 채팅 창(유튜브 라이브 채팅 스타일)과 선발 명단 오버레이를 띄웁니다.
 - 게임 소리(해설)를 이 PC 안에서 받아쓰고(faster-whisper), 스코어보드를 읽고(RapidOCR),
-  이 PC에서 돌아가는 AI(Ollama)로 채팅을 만듭니다. 외부 API는 쓰지 않습니다.
+  이 PC에서 돌아가는 AI(Ollama)로 채팅을 만듭니다. 원하면 Claude API로 바꿀 수 있습니다 (메뉴 → AI 설정).
+- 받아쓴 해설은 게임 위 자막 창으로도 띄웁니다 (말하는 중에도 먼저 뜨는 미리보기 자막, 파일 저장).
+- 채팅 분위기(모드)·세기, 방장 채팅 입력, 시청자끼리 @부르기, 채팅 캡처 저장.
 - AI나 받아쓰기가 없으면 내장 문장으로 대신 반응합니다.
 """
 from __future__ import annotations
@@ -144,6 +146,18 @@ DEFAULT_CFG = {
     "scoreboard_region": [0.0, 0.0, 0.5, 0.2],   # 화면 비율 (왼쪽, 위, 폭, 높이)
     "korean_players": KOREAN_DEFAULT,
     "lineups": {},
+    # AI: ollama = 이 PC (무료), claude = Claude API (유료, 채팅이 더 자연스러움. 화면 보고 팀 찾기는 계속 Ollama)
+    "ai_provider": "ollama",
+    "claude_api_key": "",
+    "claude_model": "claude-haiku-4-5",
+    # 채팅 분위기 (CHAT_MODES) · 세기 0~10
+    "chat_mode": "default",
+    "chat_intensity": 5,
+    "streamer_name": "방장",          # 입력창에 내가 쓴 채팅이 뜨는 이름
+    # 해설 자막
+    "show_captions": True,            # 게임 위 화면 아래쪽에 자막 창
+    "caption_preview": "auto",        # 말하는 중에 먼저 뜨는 미리보기 자막 (auto = 그래픽카드로 받아쓸 때만)
+    "save_transcript": False,         # 받아쓴 해설을 transcripts 폴더에 .txt로 저장
 }
 
 
@@ -557,6 +571,9 @@ P["scorer"] = ["{n} 골!!", "{n} 미쳤다", "역시 {n}", "{n} 해냈다!!", "{
 P["spam"] = ["골!!!!", "골!!!!!!!", "GOAL!!!", "ㅋㅋㅋㅋㅋㅋ", "와아아아", "⚽⚽⚽", "골골골", "들어갔다!!"]
 P["super_idle"] = ["{t} 화이팅!!", "오늘도 잘 보고 갑니다", "경기 재밌게 보는 중 ㅎㅎ", "{t} 이기자!!", "치킨 값 보탭니다 ㅋㅋ",
                    "응원합니다!!", "{p} 오늘 골 넣어줘", "첫 후원입니다 ㅎㅎ", "야식 먹으면서 보는 중", "{t} 사랑해요"]
+# 방장(입력창)이 채팅을 쳤을 때 AI 없이 나오는 반응
+P["host_reply"] = ["ㅋㅋㅋㅋ", "ㅇㅈ", "ㄹㅇ", "맞말", "ㄴㄴ 아님", "ㅋㅋㅋ 인정", "그니까", "완전 공감", "ㅎㅇㅎㅇ", "오 ㄹㅇ?",
+                   "ㅋㅋㅋㅋ 뭐야", "동의", "ㄹㅇㅋㅋ", "나도 그 생각함"]
 QUESTIONS = {"몇 분임?": "ans_min", "스코어 몇 대 몇?": "ans_score", "지금 몇 대 몇임?": "ans_score"}
 P["neu_idle"].append("지금 몇 대 몇임?")
 
@@ -780,7 +797,8 @@ class Audience:
     def pick(self, faction: str | None, exclude: str | None = None) -> Viewer:
         if random.random() < 0.08 or not self.people:
             return self.new_person(faction or "neutral")
-        pool = [v for v in self.people if (faction is None or v.faction == faction) and v.name != exclude]
+        ex = (exclude or "").lstrip("@")
+        pool = [v for v in self.people if (faction is None or v.faction == faction) and (not ex or v.name.lstrip("@") != ex)]
         if not pool:
             return self.new_person(faction or "neutral")
         return random.choices(pool, weights=[v.weight for v in pool])[0]
@@ -831,8 +849,8 @@ class ChatEngine:
                  .replace("{score}", f"{self.m.hs}:{self.m.as_}"))
 
     def msg(self, text: str, faction: str, kind: str | None = None, amount: int = 0, light: bool = False,
-            tpl: str | None = None) -> dict:
-        v = self.crowd.pick(faction if faction in ("home", "away", "neutral") else None)
+            tpl: str | None = None, exclude: str | None = None) -> dict:
+        v = self.crowd.pick(faction if faction in ("home", "away", "neutral") else None, exclude=exclude)
         if kind in ("super", "newmember"):
             return {"name": v.name, "text": text, "kind": kind, "amount": amount, "side": v.faction, "tpl": tpl}
         return {"name": v.name, "text": v.style(text, light), "kind": v.kind, "amount": 0, "side": v.faction, "tpl": tpl}
@@ -948,6 +966,22 @@ LIVE_MARK = "\n<<<LIVE>>>\n"
 CHATS_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "text": {"type": "string"}, "side": {"type": "string", "enum": ["home", "away", "neutral"]}},
     "required": ["text", "side"]}}
+# Claude 모델 (메뉴 → AI 설정에서 고름). 채팅은 빨라야 해서 Haiku가 기본.
+CLAUDE_MODELS = ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+CLAUDE_KEY_ERR = re.compile(r"(401|403|authentication|api[_ -]?key|permission|credit balance|billing)", re.I)
+CLAUDE_PRICES = {"claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-5": (2.0, 10.0), "claude-opus-5": (5.0, 25.0)}  # 백만 토큰당 $
+
+
+def strict_schema(s):
+    """Claude structured outputs는 모든 object에 additionalProperties: false가 있어야 함"""
+    if isinstance(s, dict):
+        out = {k: strict_schema(v) for k, v in s.items()}
+        if out.get("type") == "object":
+            out["additionalProperties"] = False
+        return out
+    if isinstance(s, list):
+        return [strict_schema(v) for v in s]
+    return s
 
 
 class LocalAI:
@@ -958,6 +992,23 @@ class LocalAI:
         self._ok = False
         self._checked = 0.0
         self._lock = threading.Lock()
+        self._claude = None                 # anthropic.Anthropic (Claude를 고르면 처음 쓸 때 만듦)
+        self._claude_key = ""
+        self.usage = {"in": 0, "out": 0}    # 이번 실행에서 Claude가 쓴 토큰
+
+    def reset(self):
+        """AI 설정을 바꾼 뒤: 다음 요청 때 다시 확인"""
+        self._checked = 0.0
+        self._claude = None
+
+    @property
+    def use_claude(self) -> bool:
+        return self.cfg.get("ai_provider") == "claude" and bool(str(self.cfg.get("claude_api_key") or "").strip())
+
+    def claude_cost(self) -> float:
+        """이번 실행 Claude 비용 추정 (달러, 백만 토큰당 입력/출력 가격)"""
+        price = CLAUDE_PRICES.get(self.cfg.get("claude_model") or "", (1.0, 5.0))
+        return self.usage["in"] / 1e6 * price[0] + self.usage["out"] / 1e6 * price[1]
 
     CHAT_MODELS = ["exaone3.5:7.8b", "gemma3:12b", "qwen2.5:7b", "exaone3.5:2.4b", "gemma3:4b"]
     VISION_MODELS = ["gemma3:4b", "gemma3:12b", "llava:7b"]
@@ -974,6 +1025,8 @@ class LocalAI:
 
     @property
     def model(self):
+        if self.use_claude:
+            return self.cfg.get("claude_model") or CLAUDE_MODELS[0]
         return self._chosen or self.cfg.get("ollama_model") or "exaone3.5:7.8b"
 
     def _req(self, path, payload=None, timeout=10):
@@ -1019,12 +1072,25 @@ class LocalAI:
             self._ok = bool(chosen)
         except Exception:
             self._ok = False
+        if self.use_claude:
+            # 채팅은 Claude로 (Ollama가 없어도 됨). 화면 보고 팀 찾기만 Ollama가 있으면 씀.
+            try:
+                import anthropic  # noqa: F401
+                self._ok = True
+            except ImportError:
+                log.warning("Claude를 골랐지만 anthropic 패키지가 없음 (install.bat을 다시 실행) → Ollama로")
         return self._ok
 
     def _chat(self, prompt, schema, images=None, num_predict=900, timeout=90, on_text=None, model=None):
         """on_text가 있으면 AI가 글자를 만드는 대로 받아서(스트리밍) 지금까지의 글을 on_text(글)로 넘김.
         그래서 채팅 10개를 다 만들 때까지 기다리지 않고 한 줄씩 바로 띄울 수 있음.
         prompt 안의 LIVE_MARK 앞부분은 system으로 — 매번 똑같아서 Ollama가 앞부분 계산을 재사용함 (첫 반응이 빨라짐)."""
+        if self.use_claude and not images:
+            try:
+                import anthropic  # noqa: F401
+                return self._claude_chat(prompt, schema, num_predict, timeout, on_text)
+            except ImportError:
+                pass
         msgs = []
         if LIVE_MARK in prompt:
             system, prompt = prompt.split(LIVE_MARK, 1)
@@ -1062,6 +1128,36 @@ class LocalAI:
             except urllib.error.HTTPError:
                 payload["format"] = "json"          # 오래된 Ollama 대비
                 text = go(payload)
+        return json.loads(text[text.find("{"): text.rfind("}") + 1])
+
+    def _claude_chat(self, prompt, schema, num_predict, timeout, on_text):
+        """Claude API. 답은 JSON 스키마(structured outputs)로 받고, on_text가 있으면 스트리밍으로 한 줄씩 넘김."""
+        import anthropic
+        key = str(self.cfg.get("claude_api_key") or "").strip()
+        if self._claude is None or key != self._claude_key:
+            self._claude = anthropic.Anthropic(api_key=key, max_retries=1)
+            self._claude_key = key
+        system, user = prompt.split(LIVE_MARK, 1) if LIVE_MARK in prompt else ("", prompt)
+        kw = dict(model=self.model, max_tokens=max(2048, num_predict * 2),
+                  messages=[{"role": "user", "content": user}],
+                  output_config={"format": {"type": "json_schema", "schema": strict_schema(schema)}})
+        if system:
+            kw["system"] = system
+        client = self._claude.with_options(timeout=float(timeout))
+        if on_text is None:
+            resp = client.messages.create(**kw)
+            text = "".join(b.text for b in resp.content if b.type == "text")
+        else:
+            text = ""
+            with client.messages.stream(**kw) as st:
+                for piece in st.text_stream:
+                    text += piece
+                    on_text(text)
+                resp = st.get_final_message()
+        self.usage["in"] += resp.usage.input_tokens
+        self.usage["out"] += resp.usage.output_tokens
+        if resp.stop_reason == "refusal":
+            raise RuntimeError("Claude가 답하지 않음 (refusal)")
         return json.loads(text[text.find("{"): text.rfind("}") + 1])
 
     def chats(self, prompt: str, on_text=None) -> dict:
@@ -1134,8 +1230,35 @@ STYLE = """너는 한국 유튜브 축구 생중계 라이브 채팅창에 있�
 - 욕설·혐오·실존 인물 모욕 금지. 팬끼리 가벼운 신경전까지만.
 - 같은 말 반복 금지, 최근 채팅과 겹치는 말 금지.
 - side = 그 채팅을 친 사람이 응원하는 팀 (home/away) 또는 neutral. 아래 '시청자 세력' 비율대로 섞을 것."""
+# 채팅 분위기 (fake-twitch-chat의 모드·세기를 한국 축구 생중계 채팅에 맞게)
+CHAT_MODES = {
+    "default": ("기본", ""),
+    "hype": ("응원 폭발", "모두가 신나 있음. 좋은 장면이면 무조건 환호, 대문자·느낌표·\"가즈아\" 많이. 부정적인 말은 거의 없음."),
+    "toxic": ("까칠", "시니컬하고 잘 안 놀람. 비꼬기, \"실력 이슈\", \"폼 하락\", 선수·감독 깎아내리기. 가볍게 비웃는 정도까지만, 욕설·혐오·인신공격은 절대 금지."),
+    "wholesome": ("훈훈", "모두 착하고 응원만 함. 상대 팀에도 박수, 실수해도 \"괜찮아\". 부정적인 말 없음."),
+    "backseat": ("훈수", "다들 감독인 척. \"저기서 왜 패스함\", \"교체 좀 해라\", \"라인 내려야지\" 같은 자신만만한 훈수와 전술 지적이 대부분."),
+    "clueless": ("엉뚱", "다들 딴소리. 경기를 잘못 알아듣거나 엉뚱한 선수·팀·규칙 이야기를 자신 있게 함. 서로 맞는 말이 없음. 그래도 짧은 채팅 말투는 그대로."),
+}
+INTENSITY_DESC = ["거의 티 안 나게", "아주 약하게", "살짝", "약하게", "조금 뚜렷하게", "적당히 뚜렷하게",
+                  "강하게", "아주 강하게", "과장될 만큼", "거의 폭주 수준으로", "한계까지 (그래도 경기 장면에 반응하는 건 유지)"]
+
+
+def style_prompt(cfg) -> str:
+    """STYLE + 지금 고른 채팅 분위기. 분위기를 바꾸지 않으면 매번 같은 글이라 Ollama가 앞부분 계산을 재사용함."""
+    mode = CHAT_MODES.get(cfg.get("chat_mode"), CHAT_MODES["default"])
+    if not mode[1]:
+        return STYLE
+    try:
+        n = max(0, min(10, int(cfg.get("chat_intensity", 5))))
+    except (TypeError, ValueError):
+        n = 5
+    return STYLE + f"\n\n[오늘 채팅 분위기: {mode[0]}]\n- {mode[1]}\n- 분위기 세기 {n}/10: {INTENSITY_DESC[n]} 드러낼 것. 위의 말투·지킬 것은 그대로."
+
+
 # 실제 축구 중계 채팅이므로 게임 이야기는 어디서 나오든 버림 (AI 채팅, 배운 문장, 닉네임)
 GAMETALK_RX = re.compile(r"(게임|겜|피파|fifa|fc\s*\d{2}|\bea\b|난이도|커리어|조작|패드|컨트롤러|그래픽|모드|유저|스트리머|방장|패치|업데이트|버그|프레임)", re.I)
+# 방장이 입력창에 쓴 말에 대답할 때는 방장·스트리머라는 말은 괜찮음
+GAMETALK_HOST_RX = re.compile(GAMETALK_RX.pattern.replace("|스트리머|방장", ""), re.I)
 FORMAL_RX = re.compile(r"(습니다|습니까|ㅂ니다|입니다|여러분|#)")
 # AI 특유의 말투 (사람은 라이브 채팅에서 이렇게 안 씀)
 CLICHE_RX = re.compile(r"(환상적|훌륭|흥미진진|박진감|힘내세요|기대됩니다|최선을 다|와우|대단한|놀라운|멋진 (골|플레이|선방|패스|경기)|"
@@ -1143,10 +1266,10 @@ CLICHE_RX = re.compile(r"(환상적|훌륭|흥미진진|박진감|힘내세요|�
 POLITE_END = re.compile(r"(요|죠|네용)[!?~ㅋㅎ.]*$")
 
 
-def clean_ai_text(text: str, kind: str) -> str | None:
+def clean_ai_text(text: str, kind: str, host: bool = False) -> str | None:
     """AI가 만든 채팅 중 어색한 것은 버리고, 끝의 마침표 같은 건 다듬음"""
     t = re.sub(r"\s+", " ", str(text or "")).strip().strip('"“”\'「」')
-    if not t or GAMETALK_RX.search(t):
+    if not t or (GAMETALK_HOST_RX if host else GAMETALK_RX).search(t):
         return None
     if kind == "super":
         return t[:120]
@@ -1215,6 +1338,7 @@ class AIWorker(threading.Thread):
                 self.do(job)
             except Exception as e:
                 log.warning("ai job failed: %s", e)
+                job["error"] = str(e)
                 self.bus.put(("ai_failed", job))
             finally:
                 self.busy = False
@@ -1338,6 +1462,7 @@ class AudioSTT(threading.Thread):
     MAX_SEG = 5.0        # 쉬지 않고 이어지는 말은 이 길이에서 끊음 (초) — 짧을수록 빨리 뜸
     END_SIL = 0.3        # 이만큼 조용하면 한 문장이 끝난 것으로 봄 (초)
     MAX_LAG = 4.0        # 받아쓰기가 이만큼 밀리면 밀린 소리는 버리고 지금 소리부터 (실시간 유지)
+    PREVIEW_EVERY = 0.7  # 말하는 중 미리보기 자막을 새로 만드는 간격 (초)
 
     def __init__(self, cfg, bus: queue.Queue, prompt_fn):
         super().__init__(daemon=True, name="stt")
@@ -1463,6 +1588,32 @@ class AudioSTT(threading.Thread):
             log.info("stt[%s] %.1fs/%.1fs: %s", lang or getattr(info, "language", "?"), took, len(piece) / SR, text)
             self.bus.put(("text", text))
 
+    def preview_on(self) -> bool:
+        """미리보기 자막: 자막을 보여 줄 때만. auto면 그래픽카드로 받아쓸 때만 (CPU는 최종 자막이 늦어지므로)."""
+        c = self.cfg
+        if not (c.get("show_captions", True) or c.get("show_transcript", False)):
+            return False
+        mode = c.get("caption_preview", "auto")
+        return bool(mode) and (mode is True or mode == "on" or (mode == "auto" and self._device == "cuda"))
+
+    def preview(self, piece):
+        """아직 말하는 중인 소리를 빠르게(beam 1) 받아써서 미리보기 자막으로. 채팅 반응에는 쓰지 않음."""
+        import numpy as np
+        peak = float(np.max(np.abs(piece))) if len(piece) else 0.0
+        if peak < 0.01:
+            return
+        piece = (piece * min(3.0, 0.9 / peak)).astype(np.float32)
+        try:
+            segs, _ = self.model.transcribe(piece, language=self.lang, beam_size=1, vad_filter=False,
+                                            condition_on_previous_text=False, temperature=0.0,
+                                            without_timestamps=True, no_speech_threshold=0.5)
+            text = clean_transcript(" ".join(s.text.strip() for s in segs if s.no_speech_prob <= 0.45))
+        except Exception as e:
+            log.info("preview failed: %s", e)
+            return
+        if text:
+            self.bus.put(("partial", text))
+
     def vote_language(self, info):
         """해설 언어 자동 찾기: 확신 있는 결과가 3번 연속 같으면 그 언어로 고정"""
         code = getattr(info, "language", None)
@@ -1510,6 +1661,7 @@ class AudioSTT(threading.Thread):
             log.info("stt on: model=%s device=%s vad=%s", self._size, self._device, vad is not None)
             buf = np.zeros(0, dtype=np.float32)
             last_check = 0.0
+            last_preview = 0.0
             while not self.stop_flag.is_set():
                 time.sleep(0.15)
                 with self.lock:
@@ -1551,6 +1703,11 @@ class AudioSTT(threading.Thread):
                 if cut is None:
                     if start > 0:                           # 말 시작 전의 소리는 버림
                         buf = buf[start:]
+                    # 아직 말하는 중 → 미리보기 자막 (realtime-captions처럼 문장이 끝나기 전에 먼저 보여 줌)
+                    if (len(buf) >= int(0.8 * SR) and time.time() - last_preview >= self.PREVIEW_EVERY
+                            and self.preview_on()):
+                        last_preview = time.time()
+                        self.preview(buf.copy())
                     continue
                 piece, buf = buf[start:cut], buf[cut:]
                 if len(piece) >= int(0.4 * SR):
@@ -1876,7 +2033,7 @@ def game_running() -> bool:
 # ---------------------------------------------------------------------------
 BG, BG2, LINE = "#0f0f0f", "#181818", "#303030"
 FG, FG2 = "#f1f1f1", "#aaaaaa"
-MEMBER, MOD = "#2ba640", "#5e84f1"
+MEMBER, MOD, OWNER = "#2ba640", "#5e84f1", "#ffd600"
 CHROMA = "#00b140"
 TIERS = [  # (최소 금액, 머리 색, 몸 색, 글자 색)
     (100000, "#d00000", "#e62117", "#ffffff"),
@@ -2041,6 +2198,8 @@ class ChatWindow:
         t.tag_configure("author", foreground="#e8e8e8" if chroma else FG2, font=self.f["author"])
         t.tag_configure("member", foreground="#ffe57f" if chroma else MEMBER, font=self.f["author"])
         t.tag_configure("mod", foreground="#b5c8ff" if chroma else MOD, font=self.f["author"])
+        # 유튜브에서 채널 주인(방장) 이름은 노란 바탕
+        t.tag_configure("owner", foreground="#0f0f0f", background=OWNER, font=self.f["author"])
         t.tag_configure("msg", foreground="#ffffff" if chroma else FG, font=self.f["msg"])
         t.tag_configure("card", spacing1=self.px(4), spacing3=self.px(4))
         self.lbl_viewers.configure(text=self.lbl_viewers.cget("text") if self.app.cfg.get("show_viewers", True) else "")
@@ -2292,27 +2451,69 @@ class ChatWindow:
     def scroll_end(self):
         self.text.yview_moveto(1.0)
 
-    # ----- 입력창 (보기용) -----
+    # ----- 입력창: 방장이 직접 채팅을 치면 시청자들이 반응함 (fake-twitch-chat의 "채팅에 말 걸기") -----
     def build_composer(self):
         cp = self.composer
         for w in cp.winfo_children():
             w.destroy()
+        name = self.app.cfg.get("streamer_name") or "방장"
         tk.Frame(cp, bg=LINE, height=1).pack(fill="x")
         inner = tk.Frame(cp, bg=BG)
         inner.pack(fill="x", padx=self.px(16), pady=(self.px(12), self.px(8)))
         top = tk.Frame(inner, bg=BG)
         top.pack(fill="x")
-        tk.Label(top, image=self.avatar("시청자", self.px(24), self.px(16)), bg=BG).pack(side="left")
-        tk.Label(top, text="시청자", bg=BG, fg=FG2, font=self.f["author"]).pack(side="left")
+        tk.Label(top, image=self.avatar(name, self.px(24), self.px(16)), bg=BG).pack(side="left")
+        tk.Label(top, text=name, bg=BG, fg=FG2, font=self.f["author"]).pack(side="left")
         field = tk.Frame(inner, bg=BG)
         field.pack(fill="x", padx=(self.px(40), 0), pady=(self.px(6), 0))
-        tk.Label(field, text="채팅...", bg=BG, fg="#717171", font=self.f["input"], anchor="w").pack(fill="x")
-        tk.Frame(field, bg="#717171", height=1).pack(fill="x", pady=(self.px(4), 0))
+        self.entry_var = tk.StringVar()
+        self.entry = tk.Entry(field, textvariable=self.entry_var, bg=BG, fg=FG, insertbackground=FG, relief="flat",
+                              bd=0, highlightthickness=0, font=self.f["input"])
+        self.entry.pack(fill="x")
+        hint = tk.Label(field, text="채팅...", bg=BG, fg="#717171", font=self.f["input"], anchor="w", cursor="xterm")
+        underline = tk.Frame(field, bg="#717171", height=1)
+        underline.pack(fill="x", pady=(self.px(4), 0))
         foot = tk.Frame(inner, bg=BG)
         foot.pack(fill="x", padx=(self.px(34), 0), pady=(self.px(6), 0))
         tk.Label(foot, text="☺", bg=BG, fg=FG2, font=self.f["title"]).pack(side="left")
-        tk.Label(foot, text="➤", bg=BG, fg="#717171", font=self.f["title"]).pack(side="right")
-        tk.Label(foot, text="0/200", bg=BG, fg="#717171", font=self.f["small"]).pack(side="right", padx=self.px(8))
+        send = tk.Label(foot, text="➤", bg=BG, fg="#717171", font=self.f["title"], cursor="hand2")
+        send.pack(side="right")
+        count = tk.Label(foot, text="0/200", bg=BG, fg="#717171", font=self.f["small"])
+        count.pack(side="right", padx=self.px(8))
+
+        def show_hint():
+            try:
+                focused = self.root.focus_get() is self.entry
+            except (KeyError, tk.TclError):     # 메뉴가 열려 있으면 focus_get이 실패할 수 있음
+                focused = False
+            if not self.entry_var.get() and not focused:
+                hint.place(in_=self.entry, x=0, rely=0.5, anchor="w")
+            else:
+                hint.place_forget()
+
+        def changed(*_):
+            v = self.entry_var.get()
+            if len(v) > 200:
+                self.entry_var.set(v[:200])
+                return
+            count.configure(text=f"{len(v)}/200")
+            send.configure(fg="#3ea6ff" if v.strip() else "#717171")
+            show_hint()
+
+        def submit(_e=None):
+            v = self.entry_var.get().strip()
+            if v:
+                self.entry_var.set("")
+                self.app.send_user_chat(v)
+            return "break"
+
+        self.entry_var.trace_add("write", changed)
+        self.entry.bind("<Return>", submit)
+        self.entry.bind("<FocusIn>", lambda e: (hint.place_forget(), underline.configure(bg="#3ea6ff")))
+        self.entry.bind("<FocusOut>", lambda e: (show_hint(), underline.configure(bg="#717171")))
+        hint.bind("<Button-1>", lambda e: self.entry.focus_set())
+        send.bind("<Button-1>", submit)
+        self.root.after(50, show_hint)
 
     # ----- 메시지 넣기 -----
     def add(self, m: dict):
@@ -2340,8 +2541,8 @@ class ChatWindow:
         else:
             a = t.index("end-1c")
             t.image_create("end", image=self.avatar(m["name"], self.px(24 * s), self.px(16)), align="center")
-            tag = m["kind"] if m["kind"] in ("member", "mod") else "author"
-            t.insert("end", m["name"], (tag,))
+            tag = m["kind"] if m["kind"] in ("member", "mod", "owner") else "author"
+            t.insert("end", f" {m['name']} " if m["kind"] == "owner" else m["name"], (tag,))
             b = self.badge(m["kind"]) if m["kind"] in ("member", "mod") else None
             if b is not None:
                 t.image_create("end", image=b, align="center")
@@ -2390,11 +2591,40 @@ class ChatWindow:
             save_cfg(cfg)
             self.apply_theme()
 
+        def toggle(key, var, after=None):
+            cfg[key] = var.get()
+            save_cfg(cfg)
+            if after:
+                after()
+
         m.add_command(label="선발 명단 설정…", command=self.app.open_lineup_editor)
         m.add_command(label="선수 기록 넣기 (골·카드·교체)…", command=self.app.open_mark_dialog)
         m.add_command(label="팀 직접 정하기…", command=self.app.open_team_dialog)
         m.add_separator()
-        m.add_checkbutton(label="해설 자막 보기", variable=self.v_trans, command=toggle_trans)
+        # 채팅 분위기·세기 (fake-twitch-chat의 모드·강도)
+        self.v_mode = tk.StringVar(value=cfg.get("chat_mode", "default"))
+        self.v_int = tk.IntVar(value=int(cfg.get("chat_intensity", 5)))
+        mm = tk.Menu(m, tearoff=0, font=self.f["small"])
+        for key, (label, _) in CHAT_MODES.items():
+            mm.add_radiobutton(label=label, value=key, variable=self.v_mode, command=lambda: toggle("chat_mode", self.v_mode, self.app.on_mode_changed))
+        mm.add_separator()
+        mi = tk.Menu(mm, tearoff=0, font=self.f["small"])
+        for n in range(11):
+            mi.add_radiobutton(label=f"{n}" + ("  (거의 티 안 남)" if n == 0 else "  (한계까지)" if n == 10 else ""),
+                               value=n, variable=self.v_int, command=lambda: toggle("chat_intensity", self.v_int, self.app.on_mode_changed))
+        mm.add_cascade(label="분위기 세기", menu=mi)
+        m.add_cascade(label="채팅 분위기", menu=mm)
+        m.add_command(label="AI 설정 (Ollama / Claude)…", command=self.app.open_ai_dialog)
+        m.add_command(label="채팅 캡처 저장 (최근 12줄)", command=self.app.save_clip)
+        m.add_separator()
+        # 해설 자막 (realtime-captions-system-audio)
+        self.v_caps = tk.BooleanVar(value=cfg.get("show_captions", True))
+        self.v_save = tk.BooleanVar(value=cfg.get("save_transcript", False))
+        m.add_checkbutton(label="게임 위에 해설 자막 띄우기", variable=self.v_caps,
+                          command=lambda: toggle("show_captions", self.v_caps, self.app.captions.refresh))
+        m.add_checkbutton(label="채팅 창 아래에 해설 자막 보기", variable=self.v_trans, command=toggle_trans)
+        m.add_checkbutton(label="받아쓴 해설을 파일로 저장 (transcripts 폴더)", variable=self.v_save,
+                          command=lambda: toggle("save_transcript", self.v_save))
         m.add_separator()
         m.add_command(label="종료", command=self.app.quit)
         self.menu = m
@@ -2731,6 +2961,104 @@ class LineupOverlay:
         self.win.after(50, self._click_through)
 
 
+class CaptionOverlay:
+    """게임 위 화면 아래쪽에 뜨는 해설 자막 (realtime-captions-system-audio의 자막 창).
+    항상 위, 클릭은 뒤 게임으로 통과, 작업 표시줄에 안 보임, 조용하면 사라짐.
+    말하는 중에는 노란 미리보기 자막, 문장이 끝나면 흰 최종 자막으로 바뀜."""
+    HIDE_AFTER = 5.0      # 마지막 자막 뒤 이만큼 조용하면 숨김 (초)
+
+    def __init__(self, app):
+        self.app = app
+        k = app.k
+        self.win = tk.Toplevel(app.root)
+        self.win.withdraw()
+        self.win.overrideredirect(True)
+        self.win.configure(bg="#0b0b0b")
+        try:
+            self.win.attributes("-topmost", True)
+            self.win.attributes("-alpha", 0.85)
+        except tk.TclError:
+            pass
+        fam = app.chat.ui
+        self.lbl = tk.Label(self.win, text="", bg="#0b0b0b", fg="#ffffff", font=(fam, -int(24 * k), "bold"),
+                            justify="center", padx=int(24 * k), pady=int(10 * k))
+        self.lbl.pack(fill="both", expand=True)
+        self.last = 0.0
+        self.shown = False
+        self._click_through_done = False
+        self.app.root.after(500, self._tick)
+
+    def _click_through(self):
+        if not IS_WIN or self._click_through_done:
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
+            GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW = -20, 0x80000, 0x20, 0x80
+            st = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, st | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
+            self._click_through_done = True
+        except Exception:
+            log.exception("caption click-through failed")
+
+    def enabled(self) -> bool:
+        return bool(self.app.cfg.get("show_captions", True)) and self.app.session_on
+
+    def show(self, text: str, partial: bool = False):
+        if not self.enabled() or not text:
+            return
+        self.lbl.configure(text=text, fg="#ffe57f" if partial else "#ffffff")
+        self.last = time.time()
+        self._place()
+        if not self.shown:
+            self.win.deiconify()
+            self.shown = True
+        self.win.lift()
+        self.win.after(50, self._click_through)
+
+    def _place(self):
+        k = self.app.k
+        mon, _ = primary_monitor()
+        if mon:
+            left, top, mw, mh = mon["left"], mon["top"], mon["width"], mon["height"]
+        else:
+            left, top, mw, mh = 0, 0, self.app.root.winfo_screenwidth(), self.app.root.winfo_screenheight()
+        # 왼쪽 아래 선발 명단, 같은 모니터 오른쪽의 채팅 창과 겹치지 않는 가운데 빈 곳에
+        lo, hi, gap = left, left + mw, int(16 * k)
+        for w_, is_left in ((self.app.overlay.win, True), (self.app.root, False)):
+            try:
+                if not w_.winfo_ismapped():
+                    continue
+                x0, x1 = w_.winfo_rootx(), w_.winfo_rootx() + w_.winfo_width()
+            except tk.TclError:
+                continue
+            if left <= x0 < left + mw:
+                if is_left and x1 < left + mw * 0.5:
+                    lo = max(lo, x1 + gap)
+                elif not is_left and x0 > left + mw * 0.5:
+                    hi = min(hi, x0 - gap)
+        w = max(int(320 * k), min(int(mw * 0.72), int(1100 * k), hi - lo - 2 * gap))
+        self.lbl.configure(wraplength=w - int(48 * k))
+        self.win.update_idletasks()
+        h = min(self.lbl.winfo_reqheight(), int(mh * 0.25))
+        x = max(left, min(left + mw - w, lo + (hi - lo - w) // 2))
+        self.win.geometry(f"{w}x{h}+{x}+{top + mh - h - int(110 * k)}")
+
+    def hide(self):
+        if self.shown:
+            self.win.withdraw()
+            self.shown = False
+
+    def refresh(self):
+        if not self.enabled():
+            self.hide()
+
+    def _tick(self):
+        if self.shown and (time.time() - self.last > self.HIDE_AFTER or not self.enabled()):
+            self.hide()
+        self.app.root.after(500, self._tick)
+
+
 class MarkDialog:
     """받아쓰기가 놓친 골·카드·교체를 직접 표시"""
 
@@ -2884,6 +3212,54 @@ class LineupEditor:
         self.top.destroy()
 
 
+class AIDialog:
+    """AI 고르기: 이 PC(Ollama, 무료) 또는 Claude API(유료, 채팅이 더 자연스러움)"""
+
+    def __init__(self, app):
+        self.app = app
+        cfg = app.cfg
+        t = tk.Toplevel(app.root)
+        t.title("AI 설정")
+        t.attributes("-topmost", True)
+        t.configure(padx=14, pady=12)
+        self.t = t
+        self.provider = tk.StringVar(value=cfg.get("ai_provider", "ollama"))
+        ttk.Radiobutton(t, text="이 PC의 AI (Ollama) — 무료", value="ollama", variable=self.provider).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(t, text="Claude API — 유료, 채팅이 더 자연스러움", value="claude", variable=self.provider).grid(row=1, column=0, columnspan=2, sticky="w")
+        tk.Label(t, text="Claude API 키").grid(row=2, column=0, sticky="w", pady=(8, 2))
+        self.key = ttk.Entry(t, width=44, show="•")
+        self.key.grid(row=2, column=1, sticky="w", pady=(8, 2))
+        self.key.insert(0, cfg.get("claude_api_key", ""))
+        tk.Label(t, text="Claude 모델").grid(row=3, column=0, sticky="w", pady=2)
+        self.model = ttk.Combobox(t, values=CLAUDE_MODELS, width=24)
+        self.model.grid(row=3, column=1, sticky="w", pady=2)
+        self.model.set(cfg.get("claude_model") or CLAUDE_MODELS[0])
+        tk.Label(t, text="내 채팅 이름").grid(row=4, column=0, sticky="w", pady=2)
+        self.name = ttk.Entry(t, width=20)
+        self.name.grid(row=4, column=1, sticky="w", pady=2)
+        self.name.insert(0, cfg.get("streamer_name") or "방장")
+        ai = app.ai
+        used = (f"이번 실행 Claude 사용량: 입력 {ai.usage['in']:,} / 출력 {ai.usage['out']:,} 토큰 (약 ${ai.claude_cost():.3f})"
+                if ai.usage["in"] else "API 키는 console.anthropic.com 에서 만들 수 있습니다. 키는 이 PC의 설정 파일에만 저장됩니다.")
+        tk.Label(t, text=used + "\n화면을 보고 팀을 찾는 기능은 Claude를 골라도 Ollama(gemma3)가 있으면 그대로 씁니다.",
+                 fg="#666666", justify="left", wraplength=460).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(t, text="저장", command=self.apply).grid(row=6, column=1, sticky="e", pady=(10, 0))
+
+    def apply(self):
+        cfg = self.app.cfg
+        cfg["ai_provider"] = self.provider.get()
+        cfg["claude_api_key"] = self.key.get().strip()
+        cfg["claude_model"] = self.model.get().strip() or CLAUDE_MODELS[0]
+        cfg["streamer_name"] = re.sub(r"\s+", " ", self.name.get()).strip()[:20] or "방장"
+        save_cfg(cfg)
+        self.app.ai.reset()
+        self.app.chat.build_composer()
+        log.info("ai provider: %s (%s)", cfg["ai_provider"], cfg["claude_model"] if cfg["ai_provider"] == "claude" else cfg.get("ollama_model"))
+        if cfg["ai_provider"] == "claude" and not cfg["claude_api_key"]:
+            messagebox.showwarning("AI 설정", "Claude API 키가 없어서 이 PC의 AI(Ollama)를 계속 씁니다.", parent=self.t)
+        self.t.destroy()
+
+
 class TeamDialog:
     def __init__(self, app):
         self.app = app
@@ -2950,6 +3326,8 @@ class App:
         self.aiw.start()
         self.chat = ChatWindow(self)
         self.overlay = LineupOverlay(self)
+        self.captions = CaptionOverlay(self)
+        self.transcript_file = None        # 받아쓴 해설 저장 파일 (킥오프마다 새 파일)
         self.session_on = False
         self.live = False                  # 킥오프 버튼을 눌렀는지 (눌러야 채팅이 나옴)
         self.kickoff_at = 0.0
@@ -3050,6 +3428,8 @@ class App:
             if th:
                 th.stop()
         self.stt = self.board = None
+        self.captions.hide()
+        self.close_transcript()
         self.teams_known = False
         self.teams_locked = False
         self.board_prev = self.board_stable = None
@@ -3103,6 +3483,7 @@ class App:
         self.chat.show_kickoff(False)
         # 새 경기: 지난 채팅과 선수 기록은 자동으로 지움
         self.chat.clear()
+        self.close_transcript()            # 새 경기는 새 해설 파일
         self.match.marks.clear()
         self.match.events.clear()
         self.refresh_overlay()
@@ -3229,8 +3610,8 @@ class App:
 
     def emit(self, m: dict):
         self.chat.add(m)
-        if m["kind"] in ("normal", "member", "mod"):
-            self.chat_log = (self.chat_log + [m])[-60:]
+        if m["kind"] in ("normal", "member", "mod", "owner"):
+            self.chat_log = (self.chat_log + [{**m, "t": time.time()}])[-60:]
         now = time.time()
         for d, f in self.engine.followups(m):
             self.queue.append((now + d, f))
@@ -3281,6 +3662,9 @@ class App:
                 self.stop_session()
         elif kind == "text":
             self.on_commentary(data)
+        elif kind == "partial":
+            self.captions.show(data, partial=True)
+            self.chat.set_transcript(data + " …")
         elif kind == "level":
             self.chat.set_level(data)
         elif kind == "stt_status":
@@ -3329,8 +3713,12 @@ class App:
                 self.chat.apply_theme()
         elif kind == "ai_failed":
             job = data
+            if self.ai.use_claude and CLAUDE_KEY_ERR.search(job.get("error", "")):
+                self.chat.set_state("● Claude 오류: API 키나 크레딧을 확인하세요 (메뉴 → AI 설정)")
             if job.get("fallback_ev"):
-                self.enqueue(self.engine.burst(job["fallback_ev"], 8))
+                msgs = self.engine.burst(job["fallback_ev"], random.randint(2, 4) if job.get("host") else 8)
+                self.apply_mention(job, msgs)
+                self.enqueue(msgs)
 
     def cooldown_ok(self, ev):
         now = time.time()
@@ -3346,6 +3734,8 @@ class App:
         m.commentary.append((time.time(), text))
         m.commentary = m.commentary[-60:]
         self.chat.set_transcript(text)
+        self.captions.show(text)
+        self.write_transcript(text)
         for t in TEAMS:
             if names_in_text(text, [t["ko"], *t["alias"]]):
                 self.alias_counts[t["ko"]] = self.alias_counts.get(t["ko"], 0) + 1
@@ -3367,7 +3757,7 @@ class App:
         before = (f"(그 직전 해설: {' / '.join(texts[:-1])})\n" if len(texts) > 1 else "")
         events = "\n".join(f"- {k}: {v}" for k, v in EVENTS.items())
         return (
-            STYLE + LIVE_MARK +
+            style_prompt(self.cfg) + LIVE_MARK +
             "방금 들어온 해설 한 문장을 보고 (1) 어떤 장면인지 판단하고 (2) 그 장면에 시청자들이 바로 치는 채팅을 만들어.\n\n"
             f"{self.context()}\n\n{before}방금 해설: {text}\n\n"
             f"event 고르기:\n{events}\n"
@@ -3379,8 +3769,9 @@ class App:
             "- 채팅 개수: none이면 0~2개, 보통 장면 2~4개, goal·penalty·red·end는 8~12개.\n"
             "- 채팅은 가장 먼저 튀어나올 짧은 반응(외침)부터 순서대로.")
 
-    def ai_msgs(self, res) -> tuple[list[dict], list[tuple[str, str]]]:
-        """AI 채팅 → 화면용 메시지. 이름·멤버 표시는 고정된 시청자 무리에서 (같은 사람이 계속 나오게)"""
+    def ai_msgs(self, res, host: bool = False) -> tuple[list[dict], list[tuple[str, str]]]:
+        """AI 채팅 → 화면용 메시지. 이름·멤버 표시는 고정된 시청자 무리에서 (같은 사람이 계속 나오게).
+        host=True: 방장이 쓴 채팅에 대한 대답 (방장이라는 말을 써도 됨)"""
         from difflib import SequenceMatcher
         msgs, pool = [], []
 
@@ -3390,7 +3781,7 @@ class App:
         seen = [core(c["text"]) for c in self.chat_log[-40:]] + self.ai_seen
         for c in res.get("chats", [])[:30]:
             kind = "super" if c.get("kind") == "super" else "normal"
-            text = clean_ai_text(c.get("text", ""), kind)
+            text = clean_ai_text(c.get("text", ""), kind, host)
             if not text:
                 continue
             k = core(text)
@@ -3406,8 +3797,11 @@ class App:
                     amt = 0
                 msgs.append(self.engine.msg(text, side, "super", min(500000, max(1000, amt or 5000))))
             else:
-                msgs.append(self.engine.msg(text, side, light=True))
-                pool.append((side, text))
+                # "@닉네임 ..."으로 누구를 부르는 채팅은 그 사람 말고 다른 사람이 친 것으로
+                called = re.match(r"@(\S+)", text)
+                msgs.append(self.engine.msg(text, side, light=True, exclude=called.group(1) if called else None))
+                if not host:
+                    pool.append((side, text))
         return msgs, pool
 
     def resolve_player(self, name: str, side: str | None = None) -> tuple[str | None, str | None]:
@@ -3626,8 +4020,140 @@ class App:
         self.enqueue(msgs, 0.1, 1.2)      # AI가 한 줄 만들 때마다 바로
 
     def on_ai_chat_part(self, data):
-        msgs, _ = self.ai_msgs({"chats": [data["chat"]]})
-        self.enqueue(msgs, 0.1, 1.5)
+        job = data["job"]
+        msgs, _ = self.ai_msgs({"chats": [data["chat"]]}, host=bool(job.get("host")))
+        self.apply_mention(job, msgs)
+        self.enqueue(msgs, *((0.8, 4.0) if job.get("host") else (0.1, 1.5)))
+
+    # ----- 방장 채팅 (입력창) -----
+    def recent_chat(self) -> list[dict]:
+        """AI에게 보여 줄 최근 채팅: 2분 안의 마지막 12줄 (오래된 채팅은 자연히 빠져서 한 주제만 맴돌지 않음)"""
+        now = time.time()
+        return [c for c in self.chat_log if now - c.get("t", 0) <= 120][-12:]
+
+    def send_user_chat(self, text: str):
+        """방장이 입력창에 쓴 채팅: 노란 이름으로 바로 띄우고, 시청자 여럿이 그 말에 반응"""
+        text = re.sub(r"[\r\n\t<>]+", " ", text).strip()[:200]
+        if not text or not self.session_on:
+            return
+        name = self.cfg.get("streamer_name") or "방장"
+        self.emit({"name": name, "text": text, "kind": "owner", "amount": 0, "side": "neutral"})
+        self.chat.scroll_end()
+        if not self.live:                 # 킥오프 전에는 시청자 채팅이 안 나옴
+            return
+        # 방장이 최근 채팅의 누군가를 부르면 (@닉네임이든 그냥 닉네임이든) 그 사람이 대답
+        mention = next((c["name"] for c in reversed(self.recent_chat())
+                        if c.get("kind") != "owner" and len(c["name"].lstrip("@")) >= 2 and c["name"].lstrip("@") in text), None)
+        if self.ai_ready():
+            n = random.randint(4, 7)
+            who = f"\n- 첫 채팅은 방장이 부른 시청자 '{mention}'의 대답." if mention else ""
+            prompt = (style_prompt(self.cfg) + LIVE_MARK +
+                      f"이 방송을 켠 방장({name})이 방금 채팅창에 \"{text}\"라고 썼어. 시청자들이 이 말에 바로 반응하는 채팅 {n}개를 만들어. "
+                      f"대답·맞장구·농담·반박을 섞어서, 짧은 반응부터. 방장을 부를 땐 '방장' 또는 @{name}.{who}\n\n{self.context()}")
+            self.aiw.submit(0, {"type": "chat", "prompt": prompt, "host": True, "mention": mention, "fallback_ev": "host_reply"})
+        else:
+            msgs = self.engine.burst("host_reply", random.randint(2, 4))
+            self.apply_mention({"mention": mention}, msgs)
+            self.enqueue(msgs, 1.0, 5.0)
+
+    def apply_mention(self, job: dict, msgs: list[dict]):
+        """방장이 부른 시청자가 있으면 그 사람이 첫 대답을 함"""
+        name = job.get("mention")
+        if not name or job.get("mention_done") or not msgs:
+            return
+        v = next((p for p in self.engine.crowd.people if p.name == name), None)
+        if v:
+            msgs[0] = {**msgs[0], "name": v.name, "kind": v.kind, "side": v.faction}
+            job["mention_done"] = True
+
+    def on_mode_changed(self):
+        """채팅 분위기를 바꾸면 미리 만들어 둔 잡담도 새 분위기로"""
+        self.idle_pool = []
+        self.last_pool_req = 0.0
+        self.request_idle_pool()
+
+    # ----- 해설 받아쓰기 저장 -----
+    def write_transcript(self, text: str):
+        if not self.cfg.get("save_transcript", False) or DEMO:
+            return
+        try:
+            if self.transcript_file is None:
+                folder = APP_DIR / "transcripts"
+                folder.mkdir(exist_ok=True)
+                path = folder / f"해설_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+                self.transcript_file = open(path, "a", encoding="utf-8")   # noqa: SIM115 (경기 동안 열어 둠)
+                self.transcript_file.write(f"# {time.strftime('%Y-%m-%d %H:%M')}  {self.match.home.label} 대 {self.match.away.label}\n\n")
+                log.info("transcript file: %s", path)
+            mnt = f" {self.match.minute}분" if self.match.minute is not None else ""
+            self.transcript_file.write(f"[{time.strftime('%H:%M:%S')}{mnt}] {text}\n")
+            self.transcript_file.flush()
+        except Exception:
+            log.exception("transcript write failed")
+
+    def close_transcript(self):
+        if self.transcript_file is not None:
+            try:
+                self.transcript_file.close()
+            except Exception:
+                pass
+            self.transcript_file = None
+
+    # ----- 채팅 캡처 (fake-twitch-chat의 Clip) -----
+    def save_clip(self):
+        rows = self.chat_log[-12:]
+        if not rows:
+            self.chat.set_state("● 저장할 채팅이 아직 없습니다")
+            return
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            ttf, ttf_reg = self.chat._font_path(True), self.chat._font_path(False)
+            S = 2                                             # 2배 해상도
+            W, pad, av, gap = 420 * S, 16 * S, 24 * S, 8 * S
+            f_name = ImageFont.truetype(ttf, 13 * S) if ttf else ImageFont.load_default()
+            f_msg = ImageFont.truetype(ttf_reg, 13 * S) if ttf_reg else ImageFont.load_default()
+            f_av = ImageFont.truetype(ttf, int(av * 0.48)) if ttf else f_msg
+            probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+            text_x, line_h = pad + av + 16 * S, 20 * S
+            lines = []                                        # (메시지, [(줄 글자, 이름 자리 포함 여부)])
+            for m in rows:
+                name_w = probe.textlength(m["name"] + "  ", font=f_name) + (8 * S if m["kind"] == "owner" else 0)
+                words, cur, first, out = m["text"].split(" "), "", True, []
+                for w in words:
+                    room = W - pad - text_x - (name_w if first else 0)
+                    t = (cur + " " + w).strip()
+                    if cur and probe.textlength(t, font=f_msg) > room:
+                        out.append(cur)
+                        cur, first = w, False
+                    else:
+                        cur = t
+                out.append(cur)
+                lines.append((m, name_w, out))
+            H = pad * 2 + sum(max(av, len(o) * line_h) + gap for _, _, o in lines)
+            im = Image.new("RGB", (W, H), BG)
+            d = ImageDraw.Draw(im)
+            y = pad
+            for m, name_w, out in lines:
+                color = AV_COLORS[sum(ord(c) * (i + 7) for i, c in enumerate(m["name"])) % len(AV_COLORS)]
+                d.ellipse((pad, y, pad + av, y + av), fill=color)
+                d.text((pad + av / 2, y + av / 2), (m["name"].lstrip("@")[:1] or "?").upper(), font=f_av, fill="white", anchor="mm")
+                nc = {"member": MEMBER, "mod": MOD}.get(m["kind"], FG2)
+                if m["kind"] == "owner":
+                    d.rounded_rectangle((text_x, y + 2 * S, text_x + name_w - 6 * S, y + line_h - 2 * S), radius=2 * S, fill=OWNER)
+                    d.text((text_x + 4 * S, y + line_h / 2), m["name"], font=f_name, fill="#0f0f0f", anchor="lm")
+                else:
+                    d.text((text_x, y + line_h / 2), m["name"], font=f_name, fill=nc, anchor="lm")
+                for i, ln in enumerate(out):
+                    d.text((text_x + (name_w if i == 0 else 0), y + line_h / 2 + i * line_h), ln, font=f_msg, fill=FG, anchor="lm")
+                y += max(av, len(out) * line_h) + gap
+            folder = APP_DIR / "clips"
+            folder.mkdir(exist_ok=True)
+            path = folder / f"채팅_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            im.save(path)
+            log.info("clip saved: %s", path)
+            self.chat.set_state(f"● 채팅 캡처 저장: clips\\{path.name}")
+        except Exception as e:
+            log.exception("clip failed")
+            self.chat.set_state(f"● 채팅 캡처 실패: {e}")
 
     # ----- 화면 아래 선수 표시 → 조작 중인 선수, 득점자 -----
     def match_hud(self, line: str) -> tuple[str, str] | None:
@@ -3790,9 +4316,11 @@ class App:
         bh = self.ball_holder()
         if bh:
             parts.append(f"지금 공을 가진 선수(화면 표시): {bh[1]} ({m.side(bh[0]).label})")
-        if self.chat_log:
-            parts.append("최근 채팅 (이어서 쓰고, 똑같은 말은 하지 말 것):\n"
-                         + "\n".join(f"[{c['name']}] {c['text']}" for c in self.chat_log[-10:]))
+        recent_chat = self.recent_chat()
+        if recent_chat:
+            owner = self.cfg.get("streamer_name") or "방장"
+            parts.append(f"최근 채팅 (이어서 쓰고, 똑같은 말은 하지 말 것. [{owner}]은 이 방송을 켠 방장):\n"
+                         + "\n".join(f"[{c['name']}] {c['text']}" for c in recent_chat))
         parts.append(f"최근 사건: {' / '.join(m.events[-6:]) or '없음'}")
         parts.append(f"최근 중계 해설(음성 받아쓰기라 오타가 있을 수 있음):\n{recent}")
         return "\n".join(parts)
@@ -3808,7 +4336,7 @@ class App:
         bg = self.last_board_goal
         who = f" 득점자: {bg['scorer']}" if bg and bg.get("scorer") else ""
         desc = {"hgoal": f"{self.match.home.label} 득점!{who}", "agoal": f"{self.match.away.label} 득점!{who}"}.get(ev, EV_DESC.get(ev, ev))
-        prompt = (STYLE + LIVE_MARK + f"방금 장면에 시청자들이 바로 치는 채팅 {n}개를 만들어. 짧은 외침부터.\n\n"
+        prompt = (style_prompt(self.cfg) + LIVE_MARK + f"방금 장면에 시청자들이 바로 치는 채팅 {n}개를 만들어. 짧은 외침부터.\n\n"
                   f"{self.context()}\n\n방금 해설: {text or '(자료 없음)'}\n장면: {desc}")
         self.aiw.submit(0, {"type": "chat", "prompt": prompt, "ev": ev, "fallback_ev": ev if ev in ("hgoal", "agoal") else None})
 
@@ -3816,7 +4344,7 @@ class App:
         if not self.ai_ready() or time.time() - self.last_pool_req < 40:
             return
         self.last_pool_req = time.time()
-        prompt = (STYLE + LIVE_MARK + "특별한 일이 없을 때 흘러가는 평범한 잡담 30개를 만들어. 팬들의 응원·신경전, 중립의 전술 얘기, "
+        prompt = (style_prompt(self.cfg) + LIVE_MARK + "특별한 일이 없을 때 흘러가는 평범한 잡담 30개를 만들어. 팬들의 응원·신경전, 중립의 전술 얘기, "
                   "선수 얘기, 인사, 먹을 거, 예측, 딴소리 같은 주제를 골고루. 골·실점 얘기는 하지 말 것.\n\n" + self.context())
         self.aiw.submit(1, {"type": "chat", "prompt": prompt, "idle": True})
 
@@ -3826,8 +4354,12 @@ class App:
         if (self.session_on and self.live and quiet and time.time() - self.last_ai_flow > 18 and self.ai_ready()):
             self.last_ai_flow = time.time()
             k = random.randint(5, 7)
-            prompt = (STYLE + LIVE_MARK + f"방금까지의 경기 흐름과 최근 채팅을 보고 이어서 올라올 채팅 {k}개를 만들어. "
-                      "경기 흐름·선수·해설이 한 말에 대한 가벼운 반응, 팬끼리 신경전, 앞 채팅에 대한 대답을 섞어서.\n\n" + self.context())
+            # 최근 채팅이 충분히 쌓였으면 시청자끼리 닉네임을 불러 주고받게 (fake-twitch-chat의 Turbo처럼 약 30%).
+            # 채팅이 없을 때 시키면 없는 대화를 지어내므로 5줄 이상일 때만.
+            talk = ("\n- 이 중 2개쯤은 위 '최근 채팅'의 닉네임을 그대로 @닉네임으로 불러서 맞장구·반박·놀리기. "
+                    "대상은 경기 이야기에 한해서." if len([c for c in self.recent_chat() if c.get("kind") != "owner"]) >= 5 else "")
+            prompt = (style_prompt(self.cfg) + LIVE_MARK + f"방금까지의 경기 흐름과 최근 채팅을 보고 이어서 올라올 채팅 {k}개를 만들어. "
+                      f"경기 흐름·선수·해설이 한 말에 대한 가벼운 반응, 팬끼리 신경전, 앞 채팅에 대한 대답을 섞어서.{talk}\n\n" + self.context())
             self.aiw.submit(2, {"type": "chat", "prompt": prompt})
         elif (self.session_on and self.live and self.cfg.get("self_review", True) and len(self.chat_log) >= 30
               and time.time() - self.last_review > self.cfg.get("review_interval_sec", 120) and self.ai_ready()):
@@ -3837,7 +4369,7 @@ class App:
     # ----- 자가 보완 -----
     def request_review(self):
         self.last_review = time.time()
-        log_rows = self.chat_log[-40:]
+        log_rows = [m for m in self.chat_log if m.get("kind") != "owner"][-40:]
         names = list(dict.fromkeys(m["name"] for m in log_rows))
         chats = "\n".join(f"{i}. [{m['name']}] {m['text']}" for i, m in enumerate(log_rows))
         name_list = "\n".join(f"{i}. {n}" for i, n in enumerate(names))
@@ -3892,11 +4424,12 @@ class App:
 
     def on_ai_chats(self, data):
         job, res = data["job"], data["res"]
-        msgs, pool = self.ai_msgs(res)
+        msgs, pool = self.ai_msgs(res, host=bool(job.get("host")))
         if job.get("idle"):
             if len(pool) >= 8:
                 self.idle_pool = pool
             return
+        self.apply_mention(job, msgs)
         self.enqueue(msgs, 0.2, 6.0)
 
     # ----- 주기 작업 -----
@@ -3929,8 +4462,12 @@ class App:
     def open_mark_dialog(self):
         MarkDialog(self)
 
+    def open_ai_dialog(self):
+        AIDialog(self)
+
     def quit(self):
         try:
+            self.close_transcript()
             for th in (self.stt, self.board):
                 if th:
                     th.stop()
