@@ -52,7 +52,10 @@ if not exist "%OLLAMA%" (
 :ollama_ok
 start "" /b "%OLLAMA%" serve >nul 2>nul
 timeout /t 5 >nul
-echo AI 모델 내려받는 중 (약 3GB, 처음 한 번)...
+echo AI 모델 내려받는 중 (약 8GB, 처음 한 번)...
+echo  - 채팅용 한국어 모델 (EXAONE 3.5)
+"%OLLAMA%" pull exaone3.5:7.8b
+echo  - 화면 보고 팀 찾는 모델 (gemma3)
 "%OLLAMA%" pull gemma3:4b
 :after_ollama
 echo.

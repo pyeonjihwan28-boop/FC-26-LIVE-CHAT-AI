@@ -121,7 +121,8 @@ KOREAN_DEFAULT = {
 
 DEFAULT_CFG = {
     "use_ai": True,
-    "ollama_model": "gemma3:4b",
+    "ollama_model": "exaone3.5:7.8b",      # 채팅 (한국어 특화). 없으면 설치된 것 중 좋은 것으로
+    "ollama_vision_model": "gemma3:4b",    # 화면 보고 팀 찾기 (그림을 볼 수 있는 모델)
     "ai_interval_sec": 10,
     "self_review": True,              # 채팅 기록을 AI에게 보내 어색한 문장·닉네임을 스스로 고치기
     "review_interval_sec": 120,
@@ -943,6 +944,12 @@ class ChatEngine:
 # ---------------------------------------------------------------------------
 # 이 PC에서 도는 AI (Ollama)
 # ---------------------------------------------------------------------------
+LIVE_MARK = "\n<<<LIVE>>>\n"
+CHATS_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
+    "text": {"type": "string"}, "side": {"type": "string", "enum": ["home", "away", "neutral"]}},
+    "required": ["text", "side"]}}
+
+
 class LocalAI:
     BASE = "http://127.0.0.1:11434"
 
@@ -952,9 +959,22 @@ class LocalAI:
         self._checked = 0.0
         self._lock = threading.Lock()
 
+    CHAT_MODELS = ["exaone3.5:7.8b", "gemma3:12b", "qwen2.5:7b", "exaone3.5:2.4b", "gemma3:4b"]
+    VISION_MODELS = ["gemma3:4b", "gemma3:12b", "llava:7b"]
+    _chosen = ""
+    _vision = ""
+
+    @staticmethod
+    def _pick(installed: list[str], wanted: list[str]) -> str:
+        for w in wanted:
+            for n in installed:
+                if n == w or (":" not in w and n.split(":")[0] == w) or n == w + ":latest":
+                    return n
+        return ""
+
     @property
     def model(self):
-        return self.cfg.get("ollama_model") or "gemma3:4b"
+        return self._chosen or self.cfg.get("ollama_model") or "exaone3.5:7.8b"
 
     def _req(self, path, payload=None, timeout=10):
         data = json.dumps(payload).encode() if payload is not None else None
@@ -990,19 +1010,30 @@ class LocalAI:
         try:
             tags = self._req("/api/tags", timeout=2)
             names = [m.get("name", "") for m in tags.get("models", [])]
-            base = self.model.split(":")[0]
-            self._ok = any(n == self.model or n.split(":")[0] == base for n in names)
+            # 설정한 모델 → 없으면 설치된 것 중 한국어를 잘하는 순서로
+            chosen = self._pick(names, [self.cfg.get("ollama_model") or ""] + self.CHAT_MODELS)
+            if chosen != self._chosen:
+                log.info("ollama chat model: %s (installed: %s)", chosen or "없음", ", ".join(names))
+            self._chosen = chosen
+            self._vision = self._pick(names, [self.cfg.get("ollama_vision_model") or ""] + self.VISION_MODELS)
+            self._ok = bool(chosen)
         except Exception:
             self._ok = False
         return self._ok
 
-    def _chat(self, prompt, schema, images=None, num_predict=900, timeout=90, on_text=None):
+    def _chat(self, prompt, schema, images=None, num_predict=900, timeout=90, on_text=None, model=None):
         """on_text가 있으면 AI가 글자를 만드는 대로 받아서(스트리밍) 지금까지의 글을 on_text(글)로 넘김.
-        그래서 채팅 10개를 다 만들 때까지 기다리지 않고 한 줄씩 바로 띄울 수 있음."""
+        그래서 채팅 10개를 다 만들 때까지 기다리지 않고 한 줄씩 바로 띄울 수 있음.
+        prompt 안의 LIVE_MARK 앞부분은 system으로 — 매번 똑같아서 Ollama가 앞부분 계산을 재사용함 (첫 반응이 빨라짐)."""
+        msgs = []
+        if LIVE_MARK in prompt:
+            system, prompt = prompt.split(LIVE_MARK, 1)
+            msgs.append({"role": "system", "content": system})
         msg = {"role": "user", "content": prompt}
         if images:
             msg["images"] = images
-        payload = {"model": self.model, "messages": [msg], "stream": on_text is not None, "keep_alive": "30m",
+        msgs.append(msg)
+        payload = {"model": model or self.model, "messages": msgs, "stream": on_text is not None, "keep_alive": "30m",
                    "format": schema, "options": {"temperature": 0.95, "top_p": 0.95, "repeat_penalty": 1.15, "num_predict": num_predict}}
 
         def go(pl):
@@ -1034,19 +1065,7 @@ class LocalAI:
         return json.loads(text[text.find("{"): text.rfind("}") + 1])
 
     def chats(self, prompt: str, on_text=None) -> dict:
-        schema = {
-            "type": "object",
-            "properties": {
-                "scored": {"type": "string", "enum": ["home", "away", "unknown", "none"]},
-                "chats": {"type": "array", "items": {"type": "object", "properties": {
-                    "name": {"type": "string"}, "text": {"type": "string"},
-                    "side": {"type": "string", "enum": ["home", "away", "neutral"]},
-                    "kind": {"type": "string", "enum": ["normal", "member", "mod", "super"]},
-                    "amount": {"type": "integer"}},
-                    "required": ["name", "text", "side", "kind", "amount"]}},
-            },
-            "required": ["scored", "chats"],
-        }
+        schema = {"type": "object", "properties": {"chats": CHATS_SCHEMA}, "required": ["chats"]}
         return self._chat(prompt, schema, on_text=on_text)
 
     def react(self, prompt: str, on_text=None) -> dict:
@@ -1054,10 +1073,7 @@ class LocalAI:
             "event": {"type": "string", "enum": list(EVENTS)},
             "team": {"type": "string", "enum": ["home", "away", "unknown"]},
             "player": {"type": "string"}, "player_in": {"type": "string"},
-            "chats": {"type": "array", "items": {"type": "object", "properties": {
-                "text": {"type": "string"}, "side": {"type": "string", "enum": ["home", "away", "neutral"]},
-                "kind": {"type": "string", "enum": ["normal", "super"]}, "amount": {"type": "integer"}},
-                "required": ["text", "side", "kind", "amount"]}}},
+            "chats": CHATS_SCHEMA},
             "required": ["event", "team", "player", "player_in", "chats"]}
         return self._chat(prompt, schema, num_predict=450, timeout=40, on_text=on_text)
 
@@ -1091,23 +1107,40 @@ class LocalAI:
                   "- home/away = 영어 공식 팀 이름, home_ko/away_ko = 한국에서 부르는 팀 이름 (예: Villarreal → 비야레알).\n"
                   "- home_color/away_color = 그 팀 대표 색 (#RRGGBB).\n"
                   "- 스코어보드가 안 보이거나 확신이 없으면 found=false.")
-        return self._chat(prompt, schema, images=[jpeg_b64], num_predict=200, timeout=60)
+        if not self._vision:
+            raise RuntimeError("그림을 볼 수 있는 모델(gemma3 등)이 없음")
+        return self._chat(prompt, schema, images=[jpeg_b64], num_predict=200, timeout=60, model=self._vision)
 
 
-RULES = """채팅 규칙:
-- 이건 실제 축구 경기 생중계야. 시청자는 진짜 경기를 보는 축구 팬. 게임·FC26·피파·EA·난이도·커리어 모드·조작·패드·그래픽·유저·스트리머 같은 게임 이야기는 절대 쓰지 말 것.
-- 시청자는 한국인. 한국 유튜브 라이브 채팅 말투: 반말, 대부분 3~15자(길어도 25자), 띄어쓰기·맞춤법은 대충, 마침표는 거의 안 씀.
-- 말투 예: "와 이걸 넣네", "키퍼 뭐함ㅋㅋ", "ㄹㅇ 폼 미쳤다", "아 제발", "심판 뭐하냐", "몇대몇임?", "ㄷㄷ", "이건 PK지".
-- 쓰지 말 말투: "~습니다", "~입니다", "정말 멋진 골이에요!", 해설처럼 상황을 설명하는 문장, 이모지 남발, 해시태그, 따옴표.
-- 모두 같은 얘기를 하지 말고 섞을 것: 짧은 감탄, 선수 평가, 심판 탓, 농담, 질문, 딴소리, 다른 채팅에 대한 맞장구.
-- 작성자 세력(side)을 위 '시청자 세력' 비율대로 섞을 것. 팬은 자기 팀 편에서 반응(좋은 장면엔 환호, 상대 골엔 한숨·변명·신경전), 중립은 재미·분석 위주.
-- 해설 내용과 선수 이름에 실제로 반응할 것. 같은 문장 반복 금지.
-- 욕설, 비속어, 혐오 표현, 실존 인물 모욕 금지. 팬끼리 가벼운 신경전까지만.
-- name은 짧은 닉네임 아무거나. 실존 인물 이름 금지.
-- kind는 대부분 normal. amount는 super일 때만 1000~100000 원, 나머지는 0."""
+STYLE = """너는 한국 유튜브 축구 생중계 라이브 채팅창에 있는 여러 시청자들이야. 진짜 사람들이 치는 채팅처럼 써.
+
+[말투]
+- 반말. 대부분 2~12자, 길어도 25자. 완전한 문장 말고 툭 던지는 말.
+- 맞춤법·띄어쓰기 신경 안 씀. 마침표 안 찍음. 느낌표는 가끔만.
+- ㅋㅋ ㄷㄷ ㅠㅠ ㄹㅇ ㅇㅈ ㄴㄴ ㅁㅊ 같은 초성·줄임말을 자연스럽게 (남발은 말고).
+- "진짜", "개", "미쳤다", "실화냐", "레전드", "뭐함" 같은 인터넷 말투.
+- 사람마다 말투가 다름: 누구는 ㅋㅋ만 치고, 누구는 분석하고, 누구는 딴소리, 누구는 질문.
+- 팬은 편파적. 자기 팀 좋은 장면엔 흥분, 상대가 잘하면 깎아내리거나 한숨. 중립은 구경꾼 느낌.
+- 가끔 최근 채팅에 대답하거나 맞장구 (예: "@닉네임 ㄹㅇ", "ㄴㄴ 그건 아님").
+
+[이런 느낌으로]
+ㅋㅋㅋㅋㅋㅋ / 와 / ㄷㄷ / 미쳤다 / 아니 이걸 못넣네 / 키퍼 뭐함 / 개잘하네 / 방금 뭐임 / 심판 눈 감았냐 / ㅠㅠㅠ / 이게 들어가네 / 레전드 / 실화냐 / 아 제발 / 수비 다 누웠네 ㅋㅋ / 폼 미쳤다 / 오늘 좀 치네 / 빨리 좀 차라 / ㅇㅈ / ㄴㄴ 그건 아님 / 이거 PK각인데 / 라인 개높네 / 크로스 봐라 / 누가 좀 막아 / 역습 ㄱㄱ / 후반에 뒤집는다 / 지금 몇분임 / 하 진짜 / 노마크였는데 / 슈팅 좀 때려 / 오프사이드 아님? / 소름 / 이 경기 재밌네 / 해설 텐션 ㅋㅋ / 아 아깝 / 골대 ㅠ / 치킨 먹다 뿜음 / 방금 들어옴 몇대몇? / 저거 카드 아님? / 교체 언제함 / 중원 털리는중
+
+[이렇게 쓰면 안 됨 — AI티 남]
+정말 멋진 골이네요! / 환상적인 플레이입니다 / 경기가 흥미진진하네요 / 모두 힘내세요! / 와우! 대단한 선방! / 오늘 경기 정말 기대됩니다 / 선수들 모두 최선을 다하고 있어요 / #축구 / 이모지 여러 개
+
+[지킬 것]
+- 실제 축구 경기 생중계야. 게임·피파·FC·난이도·조작·그래픽·스트리머 이야기는 절대 쓰지 말 것.
+- 욕설·혐오·실존 인물 모욕 금지. 팬끼리 가벼운 신경전까지만.
+- 같은 말 반복 금지, 최근 채팅과 겹치는 말 금지.
+- side = 그 채팅을 친 사람이 응원하는 팀 (home/away) 또는 neutral. 아래 '시청자 세력' 비율대로 섞을 것."""
 # 실제 축구 중계 채팅이므로 게임 이야기는 어디서 나오든 버림 (AI 채팅, 배운 문장, 닉네임)
 GAMETALK_RX = re.compile(r"(게임|겜|피파|fifa|fc\s*\d{2}|\bea\b|난이도|커리어|조작|패드|컨트롤러|그래픽|모드|유저|스트리머|방장|패치|업데이트|버그|프레임)", re.I)
 FORMAL_RX = re.compile(r"(습니다|습니까|ㅂ니다|입니다|여러분|#)")
+# AI 특유의 말투 (사람은 라이브 채팅에서 이렇게 안 씀)
+CLICHE_RX = re.compile(r"(환상적|훌륭|흥미진진|박진감|힘내세요|기대됩니다|최선을 다|와우|대단한|놀라운|멋진 (골|플레이|선방|패스|경기)|"
+                       r"경기가 .*(네요|군요)|선수들 모두|모두들|함께 응원|응원해요)")
+POLITE_END = re.compile(r"(요|죠|네용)[!?~ㅋㅎ.]*$")
 
 
 def clean_ai_text(text: str, kind: str) -> str | None:
@@ -1117,8 +1150,12 @@ def clean_ai_text(text: str, kind: str) -> str | None:
         return None
     if kind == "super":
         return t[:120]
-    if FORMAL_RX.search(t) or len(t) > 40:
+    if FORMAL_RX.search(t) or CLICHE_RX.search(t) or len(t) > 32:
         return None
+    if POLITE_END.search(t) and random.random() < 0.85:     # 존댓말은 드물게만
+        return None
+    t = t.replace("정말", "진짜")
+    t = re.sub(r"!{2,}", lambda m: "!" * random.choice([1, 1, 2]), t)
     if t.endswith(".") and not t.endswith(".."):
         t = t[:-1]
     return t
@@ -2926,6 +2963,7 @@ class App:
         self.hype_t = time.time()
         self.last_pool_req = 0.0
         self.chat_log: list[dict] = []       # 화면에 나온 채팅 (자가 보완용)
+        self.ai_seen: list[str] = []         # 최근 받은 AI 채팅 (겹치는 말 거르기)
         self.last_review = time.time()
         self.viewers = 0
         self.last_seen: dict[str, float] = {}
@@ -3025,6 +3063,8 @@ class App:
         c["use_ai"] = True            # AI가 없으면 LocalAI.available()이 알아서 내장 문장으로
         c["speed"] = "normal"         # 속도는 시청자 수와 장면으로
         c["ai_interval_sec"] = min(10, int(c.get("ai_interval_sec", 10)))
+        if c.get("ollama_model") in (None, "", "gemma3:4b"):           # 예전 기본값 → 한국어 특화 모델
+            c["ollama_model"] = "exaone3.5:7.8b"
         c["always_on_top"] = True
         c["show_viewers"] = True
         c["show_composer"] = True
@@ -3327,8 +3367,8 @@ class App:
         before = (f"(그 직전 해설: {' / '.join(texts[:-1])})\n" if len(texts) > 1 else "")
         events = "\n".join(f"- {k}: {v}" for k, v in EVENTS.items())
         return (
-            "너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 방금 들어온 해설 한 문장을 보고 "
-            "(1) 어떤 장면인지 판단하고 (2) 그 장면에 시청자들이 바로 반응하는 채팅을 만들어.\n\n"
+            STYLE + LIVE_MARK +
+            "방금 들어온 해설 한 문장을 보고 (1) 어떤 장면인지 판단하고 (2) 그 장면에 시청자들이 바로 치는 채팅을 만들어.\n\n"
             f"{self.context()}\n\n{before}방금 해설: {text}\n\n"
             f"event 고르기:\n{events}\n"
             "- 해설은 음성 받아쓰기라 오타가 있을 수 있음. 앞뒤 해설 흐름을 같이 보고 판단할 것.\n"
@@ -3336,18 +3376,28 @@ class App:
             "- team: 그 장면의 주인공 팀 (골이면 넣은 팀, 파울·카드면 저지른 팀). 모르면 unknown.\n"
             "- player: 해설에 나온 주인공 선수 이름. 해설이 영어 이름이나 원어 발음으로 불러도 명단의 한국어 이름 그대로. 없으면 빈 문자열. "
             "교체면 player=나가는 선수, player_in=들어오는 선수.\n"
-            "- 채팅 개수: none이면 0~2개, 보통 장면 2~4개, goal·penalty·red·end는 8~12개.\n\n"
-            f"{RULES}\n- super(후원)는 goal·penalty·red·end일 때만 1개 이하.\n"
+            "- 채팅 개수: none이면 0~2개, 보통 장면 2~4개, goal·penalty·red·end는 8~12개.\n"
             "- 채팅은 가장 먼저 튀어나올 짧은 반응(외침)부터 순서대로.")
 
     def ai_msgs(self, res) -> tuple[list[dict], list[tuple[str, str]]]:
         """AI 채팅 → 화면용 메시지. 이름·멤버 표시는 고정된 시청자 무리에서 (같은 사람이 계속 나오게)"""
+        from difflib import SequenceMatcher
         msgs, pool = [], []
+
+        def core(t):
+            return re.sub(r"[\sㅋㅎㅠㅜ!?~.]+", "", t)
+        # 화면에 뜬 채팅 + 아직 대기 중인 AI 채팅 모두와 비교
+        seen = [core(c["text"]) for c in self.chat_log[-40:]] + self.ai_seen
         for c in res.get("chats", [])[:30]:
             kind = "super" if c.get("kind") == "super" else "normal"
             text = clean_ai_text(c.get("text", ""), kind)
             if not text:
                 continue
+            k = core(text)
+            if k and any(k == x or (len(k) >= 5 and SequenceMatcher(None, k, x).ratio() >= 0.85) for x in seen):
+                continue
+            seen.append(k)
+            self.ai_seen = (self.ai_seen + [k])[-80:]
             side = c.get("side") if c.get("side") in ("home", "away", "neutral") else self.engine.pick_faction()
             if kind == "super":
                 try:
@@ -3730,15 +3780,22 @@ class App:
         kor = "; ".join(f"{m.side(k).label}에 한국 선수({', '.join(m.korean_names(k))})가 있어 한국인 시청자 일부가 이 팀을 응원"
                         for k in ("home", "away") if m.has_korean(k))
         recent = "\n".join("- " + t for _, t in m.commentary[-8:]) or "- (아직 없음)"
-        return (f"홈 팀: {m.home.label} (선수: {m.lineup_desc('home') or '정보 없음'})\n"
-                f"원정 팀: {m.away.label} (선수: {m.lineup_desc('away') or '정보 없음'})\n"
-                f"현재 스코어: {m.score_text()}\n"
-                f"경기 시간: {str(m.minute) + '분' if m.minute is not None else '알 수 없음'}\n"
-                f"시청자 세력: {m.home.label} 팬 {sp['home']:.1f}%, {m.away.label} 팬 {sp['away']:.1f}%, 중립 {sp['neutral']:.1f}%"
-                + (f"\n참고: {kor}" if kor else "") +
-                + (f"\n지금 공을 가진 선수(화면 표시): {bh[1]} ({m.side(bh[0]).label})" if (bh := self.ball_holder()) else "") +
-                f"\n최근 사건: {' / '.join(m.events[-6:]) or '없음'}\n"
-                f"최근 중계 해설(음성 받아쓰기라 오타가 있을 수 있음):\n{recent}")
+        parts = [f"홈 팀: {m.home.label} (선수: {m.lineup_desc('home') or '정보 없음'})",
+                 f"원정 팀: {m.away.label} (선수: {m.lineup_desc('away') or '정보 없음'})",
+                 f"현재 스코어: {m.score_text()}",
+                 f"경기 시간: {str(m.minute) + '분' if m.minute is not None else '알 수 없음'}",
+                 f"시청자 세력: {m.home.label} 팬 {sp['home']:.1f}%, {m.away.label} 팬 {sp['away']:.1f}%, 중립 {sp['neutral']:.1f}%"]
+        if kor:
+            parts.append(f"참고: {kor}")
+        bh = self.ball_holder()
+        if bh:
+            parts.append(f"지금 공을 가진 선수(화면 표시): {bh[1]} ({m.side(bh[0]).label})")
+        if self.chat_log:
+            parts.append("최근 채팅 (이어서 쓰고, 똑같은 말은 하지 말 것):\n"
+                         + "\n".join(f"[{c['name']}] {c['text']}" for c in self.chat_log[-10:]))
+        parts.append(f"최근 사건: {' / '.join(m.events[-6:]) or '없음'}")
+        parts.append(f"최근 중계 해설(음성 받아쓰기라 오타가 있을 수 있음):\n{recent}")
+        return "\n".join(parts)
 
     def ai_ready(self):
         return self.cfg.get("use_ai", True) and self.ai.available()
@@ -3751,19 +3808,16 @@ class App:
         bg = self.last_board_goal
         who = f" 득점자: {bg['scorer']}" if bg and bg.get("scorer") else ""
         desc = {"hgoal": f"{self.match.home.label} 득점!{who}", "agoal": f"{self.match.away.label} 득점!{who}"}.get(ev, EV_DESC.get(ev, ev))
-        sup = ("큰 장면이니 kind super(후원 채팅)를 1~2개 섞을 것. 후원은 주로 기뻐하는 쪽 팬이 보냄." if ev in ("hgoal", "agoal")
-               else "kind super는 쓰지 말 것.")
-        prompt = (f"너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 방금 장면에 시청자들이 반응하는 채팅 {n}개를 만들어.\n\n"
-                  f"{self.context()}\n\n방금 해설: {text or '(자료 없음)'}\n장면: {desc}\n\n{RULES}\n- {sup}\n- scored는 none.")
+        prompt = (STYLE + LIVE_MARK + f"방금 장면에 시청자들이 바로 치는 채팅 {n}개를 만들어. 짧은 외침부터.\n\n"
+                  f"{self.context()}\n\n방금 해설: {text or '(자료 없음)'}\n장면: {desc}")
         self.aiw.submit(0, {"type": "chat", "prompt": prompt, "ev": ev, "fallback_ev": ev if ev in ("hgoal", "agoal") else None})
 
     def request_idle_pool(self):
         if not self.ai_ready() or time.time() - self.last_pool_req < 40:
             return
         self.last_pool_req = time.time()
-        prompt = (f"너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 특별한 사건이 없을 때 흘러가는 평범한 잡담 30개를 만들어. "
-                  f"팬들의 응원·신경전, 중립 팬의 전술 이야기, 선수 이야기, 인사, 먹을 것, 예측 같은 주제. 골이나 실점 이야기는 하지 말 것.\n\n"
-                  f"{self.context()}\n\n{RULES}\n- kind super는 쓰지 말 것.\n- scored는 none.")
+        prompt = (STYLE + LIVE_MARK + "특별한 일이 없을 때 흘러가는 평범한 잡담 30개를 만들어. 팬들의 응원·신경전, 중립의 전술 얘기, "
+                  "선수 얘기, 인사, 먹을 거, 예측, 딴소리 같은 주제를 골고루. 골·실점 얘기는 하지 말 것.\n\n" + self.context())
         self.aiw.submit(1, {"type": "chat", "prompt": prompt, "idle": True})
 
     def tick_flow(self):
@@ -3772,9 +3826,8 @@ class App:
         if (self.session_on and self.live and quiet and time.time() - self.last_ai_flow > 18 and self.ai_ready()):
             self.last_ai_flow = time.time()
             k = random.randint(5, 7)
-            prompt = (f"너는 실제 축구 경기 생중계를 보는 한국 유튜브 라이브 채팅 생성기야. 방금까지의 해설 흐름을 보고 시청자들이 쓸 법한 채팅 {k}개를 만들어. "
-                      f"큰 사건이 없으면 경기 흐름, 선수, 해설이 한 말에 대한 가벼운 반응과 팬끼리의 신경전 위주로.\n\n"
-                      f"{self.context()}\n\n{RULES}\n- kind super는 쓰지 말 것.\n- scored는 none.")
+            prompt = (STYLE + LIVE_MARK + f"방금까지의 경기 흐름과 최근 채팅을 보고 이어서 올라올 채팅 {k}개를 만들어. "
+                      "경기 흐름·선수·해설이 한 말에 대한 가벼운 반응, 팬끼리 신경전, 앞 채팅에 대한 대답을 섞어서.\n\n" + self.context())
             self.aiw.submit(2, {"type": "chat", "prompt": prompt})
         elif (self.session_on and self.live and self.cfg.get("self_review", True) and len(self.chat_log) >= 30
               and time.time() - self.last_review > self.cfg.get("review_interval_sec", 120) and self.ai_ready()):

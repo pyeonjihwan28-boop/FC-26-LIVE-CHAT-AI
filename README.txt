@@ -59,7 +59,9 @@ AI가 꺼져 있으면 해설에는 반응하지 않고 평소 잡담만 나옵�
 [설정 파일] fc26_chat_config.json
 - korean_players: 팀별 한국 선수 (2025-26 시즌 기준 추정이라 틀리면 고치세요)
 - scoreboard_region: 스코어보드 위치(화면 비율). 점수를 못 읽으면 조정하세요.
-- ollama_model: 해설 판단·채팅·엠블럼 인식에 쓰는 AI 모델 (기본 gemma3:4b)
+- ollama_model: 해설 판단·채팅에 쓰는 AI 모델 (기본 exaone3.5:7.8b, 한국어 특화).
+  없으면 설치된 것 중 gemma3:12b → qwen2.5:7b → gemma3:4b 순서로 씁니다.
+- ollama_vision_model: 화면 보고 팀 찾는 모델 (기본 gemma3:4b)
 - whisper_model: 받아쓰기 모델 (auto = 그래픽카드 있으면 large-v3-turbo, 없으면 small)
 - self_review: true면 2분마다 채팅 기록을 AI에게 보내 어색한 문장·닉네임은 빼고
   더 자연스러운 문장·닉네임을 새로 배웁니다. 배운 내용은 fc26_chat_learned.json에 쌓이고
