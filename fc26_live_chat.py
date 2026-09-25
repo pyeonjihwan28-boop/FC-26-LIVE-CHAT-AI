@@ -302,65 +302,20 @@ class Match:
 # ---------------------------------------------------------------------------
 # 해설 속 장면 감지
 # ---------------------------------------------------------------------------
-NOT_SCORE = re.compile(r"(득점\s*(기회|찬스|없이|실패|을?\s*노|하지\s*못|에\s*실패|권)|넣었어야|넣지\s*못|실점\s*위기|골\s*찬스|골\s*기회|옆\s*그물)")
-DETECT = [
-    ("end", re.compile(r"(경기\s*(가|는)?\s*(종료|끝)|종료\s*휘슬|모든\s*경기가\s*끝|full[\s-]?time|final whistle)", re.I)),
-    ("half", re.compile(r"(전반\s*(전)?\s*(이|은)?\s*(종료|끝)|하프\s*타임|half[\s-]?time)", re.I)),
-    ("kickoff", re.compile(r"(킥\s*오프|경기\s*시작|후반\s*(전)?\s*(이|을)?\s*시작|kick[\s-]?off|we('re| are) underway)", re.I)),
-    ("red", re.compile(r"(레드\s*카드|퇴장|경고\s*누적|red card|sent off|sending off)", re.I)),
-    # 골이 취소되면 득점이 아니라 판정 장면
-    ("var", re.compile(r"(노\s*골(?!적)|골\s*(이|은)?\s*취소|득점\s*(이|은)?\s*(취소|인정되지)|\bvar\b|비디오\s*판독|disallowed|ruled out)", re.I)),
-    ("score", re.compile(r"(득점|골망|골\s*네트|그물을\s*(흔|가르|가릅|갈라)|골문을\s*(흔|가르|가릅|갈라)|골인|넣었습니다|넣습니다|넣어요|넣었어요|골입니다|골이에요|골이죠|골{2,}|(^|\s)골(\s|$|!|~)|\bgoal\b|scores|scored|back of the net)", re.I)),
-    ("penalty", re.compile(r"(페널티\s*킥|페널티\s*스팟|페널티를?\s*(선언|얻|줍|내줍|내주|찍)|\bpk\b|penalty\s*(kick|awarded|given|spot))", re.I)),
-    ("post", re.compile(r"(골대|골\s*포스트|크로스바|골\s*바|woodwork|crossbar|the post|off the bar)", re.I)),
-    ("save", re.compile(r"(선방|막아냅니다|막아냈|막아요|막습니다|막아\s*냅|잡아냅니다|잡아냈|쳐\s*냅니다|쳐냈|펀칭|세이브|\bsaves?\b|great stop|denied)", re.I)),
-    ("yellow", re.compile(r"(옐로\s*카드|경고|카드를\s*(꺼|받)|\byellow\b|booked)", re.I)),
-    ("offside", re.compile(r"(오프\s*사이드|offside)", re.I)),
-    ("miss", re.compile(r"(빗나갑니다|빗나가|벗어납니다|벗어나|놓칩니다|놓쳤|하늘로|옆\s*그물|넘어갑니다|아쉽습니다|넣었어야|\bwide\b|over the bar|misses|missed)", re.I)),
-    ("sub", re.compile(r"(교체|substitut|comes on|coming off)", re.I)),
-    ("corner", re.compile(r"(코너\s*킥|코너\s*플래그|corner)", re.I)),
-    ("freekick", re.compile(r"(프리\s*킥|free[\s-]?kick)", re.I)),
-]
-COOLDOWN = {"score": 25, "end": 60, "half": 60, "kickoff": 60, "red": 20, "penalty": 20,
-            "chance": 5, "shot": 5, "cross": 6, "dribble": 6, "foul": 6, "attack": 6, "injury": 15, "pass": 8, "keeper": 8}
-MINOR = {"corner", "freekick", "offside", "sub"}
-BIG = {"hgoal", "agoal", "end", "red", "penalty"}
-EV_DESC = {
-    "save": "골키퍼의 선방", "miss": "결정적인 찬스를 놓침", "post": "슈팅이 골대를 맞음",
-    "penalty": "페널티킥 상황", "yellow": "경고 카드", "red": "퇴장", "var": "VAR/판정 논란",
-    "offside": "오프사이드", "corner": "코너킥", "freekick": "프리킥", "sub": "선수 교체",
-    "kickoff": "킥오프", "half": "전반 종료, 하프타임", "end": "경기 종료", "score": "골이 나온 것 같음",
+# AI가 해설 한 문장을 보고 고르는 장면 (단어로 감지하지 않음)
+EVENTS = {
+    "goal": "방금 골이 들어감 (골 기회·아쉬움·취소된 골은 아님)", "save": "골키퍼 선방", "miss": "결정적인 슈팅이 빗나감",
+    "post": "슈팅이 골대를 맞음", "penalty": "페널티킥 선언", "yellow": "경고 카드", "red": "퇴장", "var": "VAR·판정 논란·골 취소",
+    "offside": "오프사이드", "corner": "코너킥", "freekick": "프리킥", "sub": "선수 교체", "kickoff": "킥오프·후반 시작",
+    "half": "전반 종료", "end": "경기 종료", "chance": "좋은 득점 기회", "shot": "슈팅", "cross": "크로스·헤딩",
+    "dribble": "드리블 돌파", "foul": "파울·거친 태클", "attack": "역습·빠른 공격", "injury": "부상", "pass": "좋은 패스",
+    "none": "특별한 장면 없음 (설명·잡담)",
 }
-
-
-# 큰 장면이 아닌 평범한 해설에도 짧게 반응하는 장면들 (위에서부터 먼저)
-MOMENTS = [
-    ("chance", re.compile(r"(찬스|결정적|위험한|위험합니다|일\s*대\s*일|1\s*대\s*1|노마크|완벽한\s*기회)")),
-    ("shot", re.compile(r"(슈팅|슛|때립니다|때렸|때려|중거리|발리|감아\s*찹|강하게\s*찹)")),
-    ("cross", re.compile(r"(크로스|헤딩|헤더|머리로)")),
-    ("dribble", re.compile(r"(드리블|제칩니다|제쳤|제쳐|돌파|개인기|탈압박)")),
-    ("foul", re.compile(r"(파울|반칙|태클|넘어집니다|넘어졌|밀었|잡아당)")),
-    ("attack", re.compile(r"(역습|속공|카운터|빠르게\s*올라|전진합니다|쇄도)")),
-    ("injury", re.compile(r"(부상|쓰러|고통|치료|들것)")),
-    ("pass", re.compile(r"(스루\s*패스|킬\s*패스|침투\s*패스|롱\s*패스|원\s*터치|패스)")),
-    ("keeper", re.compile(r"(골키퍼|키퍼)")),
-]
-
-
-def detect_moment(text: str):
-    for mv, rx in MOMENTS:
-        if rx.search(text):
-            return mv
-    return None
-
-
-def detect_event(text: str):
-    for ev, rx in DETECT:
-        if rx.search(text):
-            if ev == "score" and NOT_SCORE.search(text):
-                continue
-            return ev
-    return None
+COOLDOWN = {"goal": 25, "end": 60, "half": 60, "kickoff": 60, "red": 20, "penalty": 20}
+BIG = {"goal", "end", "red", "penalty"}
+HYPE = {"goal": 2.0, "red": 2.5, "penalty": 2.0, "end": 2.0, "kickoff": 1.0, "half": 0.8, "save": 1.2, "miss": 1.0,
+        "post": 1.3, "var": 1.0, "yellow": 0.6, "chance": 0.8, "shot": 0.5, "attack": 0.4, "dribble": 0.3, "foul": 0.4}
+EV_DESC = {k: v.split(" (")[0] for k, v in EVENTS.items()}
 
 
 def names_in_text(text: str, names: list[str]) -> list[str]:
@@ -466,7 +421,6 @@ P = {
               "아직 안 끝났다", "수비 교체 좀", "이걸 먹네", "노마킹이었음"],
     "ngoal": ["와 골 예술이다", "이 경기 재밌네", "{t} 골 ㄷㄷ", "중립인데 소름 돋음", "이제 경기 불붙는다", "빌드업부터 완벽했음",
               "수비가 너무 쉽게 열렸네", "이러면 {o} 급해지겠다", "스코어 {score}", "오늘 골 많이 나오겠는데", "킥 궤적 미쳤다", "{p} 클래스 봐라"],
-    "hint": ["골?!", "들어갔나?", "어어어", "와", "ㄷㄷㄷ", "골이다!!", "뭐야 뭐야", "헐"],
     "save": ["선방 미쳤다", "키퍼 폼 ㄷㄷ", "와 이걸 막네", "슈퍼 세이브!!", "손 뻗는 거 봐", "키퍼가 다 했다", "반사신경 무엇", "이게 막히네 ㅋㅋ", "오늘 키퍼 MOM"],
     "miss": ["아 이걸 못 넣네", "하늘로 쏘냐 ㅋㅋ", "결정력 어디 감", "이건 넣어야지", "아까비", "ㅠㅠ 아쉽다", "관중석 맞췄네", "슈팅 각은 좋았는데", "침착하게 좀"],
     "post": ["골대!!!", "땡 소리 봐", "골대 맞았다 ㄷㄷ", "아 한 뼘", "운이 없네", "골대가 수비함 ㅋㅋ", "크로스바 맞고 나왔다"],
@@ -490,19 +444,6 @@ P = {
     "neu_idle": ["점유율 좋네", "빌드업 깔끔하다", "압박 좋다", "중원 싸움 치열하다", "ㅋㅋㅋㅋ", "롱볼 너무 많음", "역습 조심", "몇 분임?",
                  "세트피스 기대", "ㅎㅇㅎㅇ", "방금 들어옴", "스코어 몇 대 몇?", "슈팅 좀 때리자", "난이도 뭐로 하세요?", "해설 목소리 좋다",
                  "중립 기어 박고 봅니다", "오늘 전술 뭐임", "양 팀 다 잘하네", "템포 빠르다", "이 경기 끝까지 본다"],
-    "chance": ["어어어", "찬스다!!", "제발 제발", "넣어라!!", "기회 왔다", "와 위험했다", "이거 들어가야지", "지금이야!!", "오 오 오"],
-    "shot": ["슈팅!", "때려!!", "오 각 좋았다", "좀 더 낮게 차지", "슛 좋다", "아 아깝다", "골문 쪽으로 좀", "파워 ㄷㄷ", "슛 타이밍 좋았는데"],
-    "cross": ["크로스 좋다", "머리만 갖다 대", "헤더 가자", "크로스 각 좋네", "아 머리에 안 맞네", "니어 니어"],
-    "dribble": ["드리블 미쳤다", "와 제치는 거 봐", "발기술 ㄷㄷ", "개인기 좋다", "하나 둘 다 제꼈다", "탈압박 봐라"],
-    "foul": ["파울이지 이건", "심판 뭐함", "휘슬 불어야지", "거칠다", "이게 파울이야?", "다이빙 아님?", "카드 줘라"],
-    "attack": ["역습 간다!!", "빠르다 빠르다", "달려라!!", "속공 좋다", "수비 몇 명임", "기회다 기회"],
-    "injury": ["괜찮나..", "부상 아니지?", "아 아프겠다", "제발 큰 부상 아니길", "일어나라"],
-    "pass": ["패스 좋다", "킬패스 ㄷㄷ", "스루패스 미쳤다", "시야 봐라", "원터치 패스 깔끔", "패스 길 봐"],
-    "keeper": ["키퍼 좋다", "잘 잡았다", "키퍼 안정감 있네", "키퍼 오늘 폼 좋음"],
-    "echo_player": ["{n} 좋다", "{n} 뭐하냐", "{n} 오늘 폼 좋네", "{n}!!", "{n} 가자", "역시 {n}", "{n} 믿는다", "{n} 잘한다"],
-    "echo_opp": ["{n} 막아라", "{n} 좀 막아", "{n} 왜 이렇게 잘함", "{n} 조심해", "{n} 또 너냐"],
-    "echo_fan": ["{t} 공격 좋다", "{t} 좀 더 올라가자", "{t} 템포 좋네", "{t} 패스 미스 좀 줄이자", "{t} 흐름 탔다", "{o} 막아라!!"],
-    "echo_kor": ["{k}!!!", "{k} 나왔다", "{k} 가자!!", "오 {k} 터치 좋다", "{k} 해설에 나왔다 ㅋㅋ"],
 }
 P.update({
     "fan_lead": ["이대로만 가자", "{t} 오늘 잡았다", "{o} 팬들 조용하네 ㅋㅋ", "한 골 더!!", "추가골 가자", "오늘 편하게 본다", "{score} 좋다 좋아",
@@ -897,31 +838,6 @@ class ChatEngine:
             out.append(self.msg(self.fill(t, f if f != "neutral" else "home"), f, tpl=t))
         return out
 
-    def echo(self, text: str, moment: str | None = None) -> list[dict]:
-        """큰 장면이 아닌 해설 문장에 반응: 장면 종류(슈팅·드리블…)와 해설에 나온 선수 이름으로"""
-        out = []
-        if moment:
-            for _ in range(random.randint(1, 3)):
-                f = self.pick_faction()
-                t = self.choose(P[moment])
-                out.append(self.msg(self.fill(t, f if f != "neutral" else "home"), f, tpl=t))
-        for key in ("home", "away"):
-            kor = self.m.korean_names(key)
-            if names_in_text(text, kor) and random.random() < 0.85:
-                for _ in range(random.randint(1, 3)):
-                    out.append(self.say("echo_kor", key))
-            players = [p for p in names_in_text(text, self.m.lineup_names(key)) if p not in kor]
-            for p in players[:2]:
-                if random.random() < 0.75:
-                    t = self.choose(P["echo_player"])
-                    out.append(self.msg(self.fill(t, key, n=p), key, tpl=t))
-                if random.random() < 0.35:
-                    other = self.m.other(key)
-                    t = self.choose(P["echo_opp"])
-                    out.append(self.msg(self.fill(t, other, n=p), other, tpl=t))
-            if self.m.side(key).name and names_in_text(text, [self.m.side(key).name]) and random.random() < 0.5:
-                out.append(self.say("echo_fan", key))
-        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1011,6 +927,18 @@ class LocalAI:
         }
         return self._chat(prompt, schema)
 
+    def react(self, prompt: str) -> dict:
+        schema = {"type": "object", "properties": {
+            "event": {"type": "string", "enum": list(EVENTS)},
+            "team": {"type": "string", "enum": ["home", "away", "unknown"]},
+            "player": {"type": "string"}, "player_in": {"type": "string"},
+            "chats": {"type": "array", "items": {"type": "object", "properties": {
+                "text": {"type": "string"}, "side": {"type": "string", "enum": ["home", "away", "neutral"]},
+                "kind": {"type": "string", "enum": ["normal", "super"]}, "amount": {"type": "integer"}},
+                "required": ["text", "side", "kind", "amount"]}}},
+            "required": ["event", "team", "player", "player_in", "chats"]}
+        return self._chat(prompt, schema, num_predict=600, timeout=40)
+
     def review(self, prompt: str) -> dict:
         schema = {"type": "object", "properties": {
             "bad_chat_ids": {"type": "array", "items": {"type": "integer"}},
@@ -1084,6 +1012,11 @@ class AIWorker(threading.Thread):
                 if job["type"] == "identify":
                     res = self.ai.identify(job["image"])
                     self.bus.put(("teams_ai", res))
+                elif job["type"] == "react":
+                    if time.time() - job["t"] > 12:   # 밀려서 한참 지난 해설은 건너뜀 (지금 해설부터)
+                        continue
+                    res = self.ai.react(job["prompt"])
+                    self.bus.put(("ai_react", {"job": job, "res": res}))
                 elif job["type"] == "review":
                     res = self.ai.review(job["prompt"])
                     self.bus.put(("ai_review", {"job": job, "res": res}))
@@ -2624,7 +2557,8 @@ class App:
         self.last_review = time.time()
         self.viewers = 0
         self.last_seen: dict[str, float] = {}
-        self.pending_goal_at = 0.0
+        self.pending_scorer = None         # (팀, 선수, 시각) — AI가 골이라고 판단한 득점자
+        self.last_board_goal = None        # (팀, 시각) — 마지막으로 점수를 올린 때
         self.board_prev = None
         self.board_stable = None
         self.teams_known = False
@@ -2931,6 +2865,8 @@ class App:
                 self.teams_changed()
         elif kind == "ai_chats":
             self.on_ai_chats(data)
+        elif kind == "ai_react":
+            self.on_ai_react(data)
         elif kind == "ai_review":
             self.on_ai_review(data)
         elif kind == "obs":
@@ -2970,87 +2906,130 @@ class App:
                 self.teams_changed()
         if not self.live:          # 킥오프 전에는 팀 찾기만 하고 채팅 반응은 안 함
             return
-        ev = detect_event(text)
-        if ev:
-            self.apply_marks(ev, text)
-        if ev and self.cooldown_ok(ev):
-            self.fire(ev, text)
-        else:
-            mv = detect_moment(text)
-            if mv and not self.cooldown_ok(mv):
-                mv = None
-            if mv:
-                self.add_hype(0.4)
-            self.enqueue(self.engine.echo(text, mv), 0.3, 3.5)     # 해설 반응은 빨리
+        if self.ai_ready():        # 어떤 장면인지, 어떻게 반응할지는 전부 AI가 판단
+            self.ai_react(text)
 
-    def apply_marks(self, ev, text):
-        """해설 속 선수 이름으로 선발 명단에 카드·교체 표시 (채팅 반응 쿨다운과 상관없이)"""
-        m = self.match
-        if ev not in ("yellow", "red", "sub"):
-            return
-        key_name = [(k, n) for k in ("home", "away") for n in names_in_text(text, m.lineup_names(k))]
-        if ev in ("yellow", "red"):
-            key_name = key_name[:1]  # 카드는 한 명
-        for k, n in key_name:
-            if ev == "sub":
-                m.mark(k, n, "on" if m.is_bench(k, n) else "off")
+    def ai_react(self, text):
+        events = "\n".join(f"- {k}: {v}" for k, v in EVENTS.items())
+        prompt = (
+            "너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 방금 들어온 해설 한 문장을 보고 "
+            "(1) 어떤 장면인지 판단하고 (2) 그 장면에 시청자들이 바로 반응하는 채팅을 만들어.\n\n"
+            f"{self.context()}\n\n방금 해설: {text}\n\n"
+            f"event 고르기:\n{events}\n"
+            "- 해설은 음성 받아쓰기라 오타가 있을 수 있음. 앞뒤 해설 흐름을 같이 보고 판단할 것.\n"
+            "- '골'이라는 말이 있어도 기회·아쉬움·골대·골키퍼 이야기면 goal이 아님. 확실할 때만 goal.\n"
+            "- team: 그 장면의 주인공 팀 (골이면 넣은 팀, 파울·카드면 저지른 팀). 모르면 unknown.\n"
+            "- player: 해설에 나온 주인공 선수 이름 (명단에 있으면 명단 이름 그대로). 없으면 빈 문자열. "
+            "교체면 player=나가는 선수, player_in=들어오는 선수.\n"
+            "- 채팅 개수: none이면 0~2개, 보통 장면 2~4개, goal·penalty·red·end는 8~12개.\n\n"
+            f"{RULES}\n- super(후원)는 goal·penalty·red·end일 때만 1개 이하.")
+        self.aiw.submit(0, {"type": "react", "text": text, "t": time.time(), "prompt": prompt})
+
+    def ai_msgs(self, res) -> tuple[list[dict], list[tuple[str, str]]]:
+        """AI 채팅 → 화면용 메시지. 이름·멤버 표시는 고정된 시청자 무리에서 (같은 사람이 계속 나오게)"""
+        msgs, pool = [], []
+        for c in res.get("chats", [])[:30]:
+            kind = "super" if c.get("kind") == "super" else "normal"
+            text = clean_ai_text(c.get("text", ""), kind)
+            if not text:
+                continue
+            side = c.get("side") if c.get("side") in ("home", "away", "neutral") else self.engine.pick_faction()
+            if kind == "super":
+                try:
+                    amt = int(c.get("amount") or 0)
+                except (TypeError, ValueError):
+                    amt = 0
+                msgs.append(self.engine.msg(text, side, "super", min(500000, max(1000, amt or 5000))))
             else:
-                team = m.side(k).label
-                last = m.marks.get(team, {}).get(n, {}).get("_card_at", 0)
-                if time.time() - last < 20:      # 같은 카드를 해설이 반복해도 한 번만
-                    continue
-                m.mark(k, n, ev)
-                m.marks[team][n]["_card_at"] = time.time()
-        if key_name:
-            self.refresh_overlay()
+                msgs.append(self.engine.msg(text, side, light=True))
+                pool.append((side, text))
+        return msgs, pool
 
-    def player_side(self, name):
-        for key in ("home", "away"):
-            if name in self.match.lineup_names(key) or name in self.match.korean_names(key):
-                return key
-        return None
+    def resolve_player(self, name: str, side: str | None = None) -> tuple[str | None, str | None]:
+        """AI가 말한 선수 이름을 선발 명단의 (팀, 이름)으로"""
+        name = str(name or "").strip()
+        if not name:
+            return None, None
+        for key in [k for k in (side, "home", "away") if k in ("home", "away")]:
+            names = self.match.lineup_names(key)
+            hits = names_in_text(name, names) or [n for n in names if n in name or name in n]
+            if hits:
+                return key, hits[0]
+        return None, None
 
-    def fire(self, ev, text=""):
+    def mark_card(self, key, name, what):
         m = self.match
-        self.add_hype({"score": 1.5, "red": 2.5, "penalty": 2.0, "end": 2.0, "kickoff": 1.0, "half": 0.8,
-                       "save": 1.2, "miss": 1.0, "post": 1.3, "var": 1.0, "yellow": 0.6}.get(ev, 0.4))
-        if ev == "score":
-            has_ocr = self.board_stable is not None
-            if has_ocr:
-                # 스코어보드가 확인해 줄 때까지 짧게 반응만
-                self.pending_goal_at = time.time()
-                self.enqueue([self.engine.say("hint", self.engine.pick_faction(), "home") for _ in range(3)], 0.2, 2.5)
+        team = m.side(key).label
+        last = m.marks.get(team, {}).get(name, {}).get("_card_at", 0)
+        if time.time() - last < 20:      # 같은 카드를 해설이 반복해도 한 번만
+            return
+        m.mark(key, name, what)
+        m.marks[team][name]["_card_at"] = time.time()
+
+    def on_ai_react(self, data):
+        job, res = data["job"], data["res"]
+        m = self.match
+        ev = res.get("event") if res.get("event") in EVENTS else "none"
+        team = res.get("team") if res.get("team") in ("home", "away") else None
+        msgs, _ = self.ai_msgs(res)
+        late = time.time() - job["t"] > 15         # 장면이 한참 지났으면 채팅은 버림 (기록은 반영)
+        log.info("ai react: %s team=%s player=%s chats=%d%s", ev, team, res.get("player"), len(msgs), " (late)" if late else "")
+        if late:
+            msgs = []
+        key, player = self.resolve_player(res.get("player"), team)
+        team = team or key
+        if ev == "goal":
+            if not self.cooldown_ok("goal"):         # 같은 골을 해설이 또 말함
+                self.enqueue(msgs[:4], 0.2, 3.0)
                 return
-            # 스코어보드가 없으면 해설 속 이름으로 어느 팀인지 판단
-            side = None
-            for key in ("home", "away"):
-                if names_in_text(text, [m.side(key).name, *m.lineup_names(key), *m.korean_names(key)]):
-                    side = key if side is None else "both"
-            if side in ("home", "away"):
-                self.goal(side, text)
+            if self.board_stable is not None:        # 점수는 스코어보드가 셈. 득점자만 기억해 둠
+                self.pending_scorer = (team, player, time.time())
+                self.add_hype(HYPE["goal"])
+                bg = self.last_board_goal
+                if bg and time.time() - bg[1] < 25 and player and (team in (None, bg[0])):
+                    self.mark_scorer(bg[0], player)
+                self.enqueue(msgs, 0.2, 4.0)
+            elif team:
+                self.goal(team, ai_msgs=msgs, scorer=player)
             else:
-                self.enqueue(self.engine.burst("hint", 5), 0.2, 2.5)
-                self.ai_event("score", text)
+                self.enqueue(msgs, 0.2, 4.0)
             return
-        if ev in MINOR:
-            self.enqueue(self.engine.burst(ev, random.randint(3, 4)), 0.3, 4.0)
-            m.push_event(EV_DESC[ev])
+        if ev in ("yellow", "red") and key and player:
+            self.mark_card(key, player, ev)
+            self.refresh_overlay()
+        if ev == "sub":
+            for nm in (res.get("player"), res.get("player_in")):
+                k2, p2 = self.resolve_player(nm, team)
+                if k2 and p2:
+                    m.mark(k2, p2, "on" if m.is_bench(k2, p2) else "off")
+            self.refresh_overlay()
+        if ev in COOLDOWN and not self.cooldown_ok(ev):
+            self.enqueue(msgs[:2], 0.2, 3.0)
             return
-        m.push_event(EV_DESC.get(ev, ev))
+        if ev != "none":
+            m.push_event(EV_DESC[ev] + (f" ({player})" if player else ""))
+            self.add_hype(HYPE.get(ev, 0.3))
         if ev in BIG:
             self.bump_viewers()
         if ev == "end":
-            self.enqueue(self.engine.burst("end", 6), 0.3, 5.0)
             ko = self.kickoff_at
             # 2분 뒤 킥오프 전으로 (그 사이 새 경기 킥오프를 눌렀으면 건드리지 않음)
             self.root.after(120000, lambda: self.kickoff_at == ko and self.pause_chat("경기 종료"))
-        else:
-            self.enqueue(self.engine.burst(ev, random.randint(3, 5)), 0.3, 4.0)
-        self.ai_event(ev, text)
         if ev in ("kickoff", "half"):
             self.request_idle_pool()
+        self.enqueue(msgs, 0.2, 3.5)
 
-    def goal(self, side, text="", ai_msgs=None):
+    def mark_scorer(self, side, name):
+        m = self.match
+        if name not in m.lineup_names(side):
+            return
+        m.mark(side, name, "goal")
+        if m.is_bench(side, name):
+            m.mark(side, name, "on")
+        self.refresh_overlay()
+
+    def goal(self, side, text="", ai_msgs=None, scorer=None):
+        """점수 올리기. 스코어보드가 점수 변화를 봤을 때, 또는 스코어보드가 없을 때 AI가 골이라고 했을 때."""
         m = self.match
         if side == "home":
             m.hs += 1
@@ -3058,24 +3037,21 @@ class App:
             m.as_ += 1
         ev = "hgoal" if side == "home" else "agoal"
         m.push_event(f"{m.side(side).label} 득점")
-        # 득점자: 최근 25초 해설에서 그 팀 선수 이름
-        scorer = None
-        cands = m.lineup_names(side)
-        for chunk in [text] + [t for ts, t in reversed(m.commentary) if time.time() - ts < 25]:
-            hit = names_in_text(chunk, cands) if chunk else []
-            if hit:
-                scorer = hit[0]
-                break
+        self.last_board_goal = (side, time.time())
+        # 득점자: AI가 알려 준 선수 (스코어보드보다 해설 판단이 먼저 왔으면 그걸 씀)
+        ps = self.pending_scorer
+        if scorer is None and ps and time.time() - ps[2] < 30 and ps[0] in (None, side):
+            scorer = ps[1]
         if scorer:
-            m.mark(side, scorer, "goal")
-            if m.is_bench(side, scorer):
-                m.mark(side, scorer, "on")
+            self.mark_scorer(side, scorer)
         self.refresh_overlay()
         self.bump_viewers()
         self.add_hype(3.0)
         self.update_state_line()
         if ai_msgs:
             self.enqueue(self.engine.goal(side, 4) + ai_msgs)
+        elif ps and time.time() - ps[2] < 30:
+            self.enqueue(self.engine.goal(side, 5))      # AI 반응은 이미 나갔으니 조금만
         elif self.ai_ready():
             self.enqueue(self.engine.goal(side, 5))
             self.ai_event(ev, text)
@@ -3146,18 +3122,16 @@ class App:
         return self.cfg.get("use_ai", True) and self.ai.available()
 
     def ai_event(self, ev, text):
+        """스코어보드가 본 골(hgoal/agoal)이나 킥오프 버튼처럼 해설 밖에서 생긴 장면에 대한 AI 채팅"""
         if not self.ai_ready():
-            if ev in ("red", "penalty", "end"):
-                self.enqueue(self.engine.burst(ev, 7))
             return
-        n = {"hgoal": 14, "agoal": 14, "score": 12, "end": 12, "red": 10, "penalty": 10}.get(ev, 8)
+        n = {"hgoal": 14, "agoal": 14}.get(ev, 8)
         desc = {"hgoal": f"{self.match.home.label} 득점!", "agoal": f"{self.match.away.label} 득점!"}.get(ev, EV_DESC.get(ev, ev))
-        sup = ("큰 장면이니 kind super(후원 채팅)를 1~2개 섞을 것. 후원은 주로 기뻐하는 쪽 팬이 보냄." if ev in BIG or ev == "score"
+        sup = ("큰 장면이니 kind super(후원 채팅)를 1~2개 섞을 것. 후원은 주로 기뻐하는 쪽 팬이 보냄." if ev in ("hgoal", "agoal")
                else "kind super는 쓰지 말 것.")
-        who = ("scored에는 해설 문맥으로 판단한 득점 팀(home/away), 모르면 unknown." if ev == "score" else "scored는 none.")
         prompt = (f"너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 방금 장면에 시청자들이 반응하는 채팅 {n}개를 만들어.\n\n"
-                  f"{self.context()}\n\n방금 해설: {text or '(자료 없음)'}\n감지된 장면: {desc}\n\n{RULES}\n- {sup}\n- {who}")
-        self.aiw.submit(0, {"type": "chat", "prompt": prompt, "ev": ev, "fallback_ev": ev if ev in ("hgoal", "agoal", "end") else None})
+                  f"{self.context()}\n\n방금 해설: {text or '(자료 없음)'}\n장면: {desc}\n\n{RULES}\n- {sup}\n- scored는 none.")
+        self.aiw.submit(0, {"type": "chat", "prompt": prompt, "ev": ev, "fallback_ev": ev if ev in ("hgoal", "agoal") else None})
 
     def request_idle_pool(self):
         if not self.ai_ready() or time.time() - self.last_pool_req < 40:
@@ -3242,32 +3216,11 @@ class App:
 
     def on_ai_chats(self, data):
         job, res = data["job"], data["res"]
-        msgs, pool = [], []
-        for c in res.get("chats", [])[:30]:
-            kind = "super" if c.get("kind") == "super" else "normal"
-            text = clean_ai_text(c.get("text", ""), kind)
-            if not text:
-                continue
-            side = c.get("side") if c.get("side") in ("home", "away", "neutral") else self.engine.pick_faction()
-            if kind == "super":
-                try:
-                    amt = int(c.get("amount") or 0)
-                except (TypeError, ValueError):
-                    amt = 0
-                msgs.append(self.engine.msg(text, side, "super", min(500000, max(1000, amt or 5000))))
-            else:
-                # 이름·멤버 표시는 AI 말고 고정된 시청자 무리에서 (같은 사람이 계속 나오게)
-                msgs.append(self.engine.msg(text, side, light=True))
-                pool.append((side, text))
+        msgs, pool = self.ai_msgs(res)
         if job.get("idle"):
             if len(pool) >= 8:
                 self.idle_pool = pool
             return
-        if job.get("ev") == "score" and self.board_stable is None:
-            sc = res.get("scored")
-            if sc in ("home", "away"):
-                self.goal(sc, ai_msgs=msgs)
-                return
         self.enqueue(msgs, 0.2, 6.0)
 
     # ----- 주기 작업 -----
