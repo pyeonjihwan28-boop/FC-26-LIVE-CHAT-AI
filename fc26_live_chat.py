@@ -469,6 +469,9 @@ P["neu_idle"] += ["오늘 경기 템포 좋네", "누가 이길 것 같음?", "�
                   "오늘 날씨 좋아 보임 ㅋㅋ", "관중 분위기 좋다", "오늘 첫 골 누가 넣을까", "빌드업 느리다", "해설 텐션 좋네",
                   "ㅎㅇ 방금 옴", "이 경기 무승부각", "공 점유 비슷하네", "저녁 먹으면서 보는 중", "화질 좋네"]
 P["kor_idle"] += ["{k} 오늘 한 골 가자", "{k} 볼 터치 부드럽다", "{k} 나올 때마다 기대됨", "역시 {k}", "{k} 패스 센스 봐"]
+P["spam"] = ["골!!!!", "골!!!!!!!", "GOAL!!!", "ㅋㅋㅋㅋㅋㅋ", "와아아아", "⚽⚽⚽", "골골골", "들어갔다!!"]
+P["super_idle"] = ["{t} 화이팅!!", "오늘도 잘 보고 갑니다", "경기 재밌게 보는 중 ㅎㅎ", "{t} 이기자!!", "치킨 값 보탭니다 ㅋㅋ",
+                   "응원합니다!!", "{p} 오늘 골 넣어줘", "첫 후원입니다 ㅎㅎ", "야식 먹으면서 보는 중", "{t} 사랑해요"]
 QUESTIONS = {"몇 분임?": "ans_min", "스코어 몇 대 몇?": "ans_score", "지금 몇 대 몇임?": "ans_score"}
 P["neu_idle"].append("지금 몇 대 몇임?")
 
@@ -793,11 +796,25 @@ class ChatEngine:
             return [(random.uniform(1.5, 5.0), {"name": v.name, "text": v.style(reply), "kind": v.kind, "amount": 0, "side": v.faction})]
         return []
 
+    def random_super(self) -> dict:
+        f = self.pick_faction()
+        key = f if f != "neutral" else random.choice(["home", "away"])
+        return self.msg(self.fill(random.choice(P["super_idle"]), key), f, "super",
+                        random.choice([1000, 1000, 2000, 2000, 3000, 5000, 5000, 10000, 20000]))
+
+    def new_member(self, faction: str | None = None) -> dict:
+        v = self.crowd.pick(faction or self.pick_faction())
+        v.kind = "member"          # 이 사람은 이제부터 멤버로 보임
+        return {"name": v.name, "text": "", "kind": "newmember", "amount": 0, "side": v.faction}
+
     def goal(self, scorer: str, n: int = 16) -> list[dict]:
         out = []
         for _ in range(n):
             f = self.pick_faction()
-            if f == scorer:
+            if f == scorer and random.random() < 0.3:    # 골 도배 (똑같은 외침이 여러 번)
+                v = self.crowd.pick(f)
+                out.append({"name": v.name, "text": random.choice(P["spam"]), "kind": v.kind, "amount": 0, "side": f})
+            elif f == scorer:
                 out.append(self.say("celeb", f, scorer))
             elif f == "neutral":
                 out.append(self.say("ngoal", f, scorer))
@@ -807,9 +824,7 @@ class ChatEngine:
             out.append(self.msg(self.fill(self.choose(P["super_goal"]), scorer), scorer, "super",
                                 random.choice([2000, 2000, 5000, 5000, 10000, 20000, 50000])))
         if random.random() < 0.5:
-            v = self.crowd.pick(scorer)
-            v.kind = "member"      # 이 사람은 이제부터 멤버로 보임
-            out.append({"name": v.name, "text": "", "kind": "newmember", "amount": 0, "side": scorer})
+            out.append(self.new_member(scorer))
         return out
 
     def burst(self, ev: str, n: int = 8) -> list[dict]:
@@ -896,22 +911,44 @@ class LocalAI:
             self._ok = False
         return self._ok
 
-    def _chat(self, prompt, schema, images=None, num_predict=900, timeout=90):
+    def _chat(self, prompt, schema, images=None, num_predict=900, timeout=90, on_text=None):
+        """on_text가 있으면 AI가 글자를 만드는 대로 받아서(스트리밍) 지금까지의 글을 on_text(글)로 넘김.
+        그래서 채팅 10개를 다 만들 때까지 기다리지 않고 한 줄씩 바로 띄울 수 있음."""
         msg = {"role": "user", "content": prompt}
         if images:
             msg["images"] = images
-        payload = {"model": self.model, "messages": [msg], "stream": False, "keep_alive": "30m",
+        payload = {"model": self.model, "messages": [msg], "stream": on_text is not None, "keep_alive": "30m",
                    "format": schema, "options": {"temperature": 0.95, "top_p": 0.95, "repeat_penalty": 1.15, "num_predict": num_predict}}
+
+        def go(pl):
+            if on_text is None:
+                return self._req("/api/chat", pl, timeout=timeout).get("message", {}).get("content", "")
+            req = urllib.request.Request(self.BASE + "/api/chat", data=json.dumps(pl).encode(),
+                                         headers={"Content-Type": "application/json"})
+            buf = ""
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                for line in r:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line.decode("utf-8"))
+                    if d.get("error"):
+                        raise RuntimeError(d["error"])
+                    buf += d.get("message", {}).get("content", "")
+                    on_text(buf)
+                    if d.get("done"):
+                        break
+            return buf
+
         with self._lock:
             try:
-                r = self._req("/api/chat", payload, timeout=timeout)
+                text = go(payload)
             except urllib.error.HTTPError:
                 payload["format"] = "json"          # 오래된 Ollama 대비
-                r = self._req("/api/chat", payload, timeout=timeout)
-        text = r.get("message", {}).get("content", "")
+                text = go(payload)
         return json.loads(text[text.find("{"): text.rfind("}") + 1])
 
-    def chats(self, prompt: str) -> dict:
+    def chats(self, prompt: str, on_text=None) -> dict:
         schema = {
             "type": "object",
             "properties": {
@@ -925,9 +962,9 @@ class LocalAI:
             },
             "required": ["scored", "chats"],
         }
-        return self._chat(prompt, schema)
+        return self._chat(prompt, schema, on_text=on_text)
 
-    def react(self, prompt: str) -> dict:
+    def react(self, prompt: str, on_text=None) -> dict:
         schema = {"type": "object", "properties": {
             "event": {"type": "string", "enum": list(EVENTS)},
             "team": {"type": "string", "enum": ["home", "away", "unknown"]},
@@ -937,7 +974,7 @@ class LocalAI:
                 "kind": {"type": "string", "enum": ["normal", "super"]}, "amount": {"type": "integer"}},
                 "required": ["text", "side", "kind", "amount"]}}},
             "required": ["event", "team", "player", "player_in", "chats"]}
-        return self._chat(prompt, schema, num_predict=600, timeout=40)
+        return self._chat(prompt, schema, num_predict=450, timeout=40, on_text=on_text)
 
     def review(self, prompt: str) -> dict:
         schema = {"type": "object", "properties": {
@@ -988,8 +1025,22 @@ def clean_ai_text(text: str, kind: str) -> str | None:
     return t
 
 
+def parse_head(s: str) -> dict:
+    """스트리밍 중인 AI 답에서 장면·팀·선수 부분만 먼저 뽑음"""
+    out = {}
+    for k in ("event", "team", "player", "player_in"):
+        m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % k, s)
+        try:
+            out[k] = json.loads('"%s"' % m.group(1)) if m else ""
+        except Exception:
+            out[k] = ""
+    return out
+
+
 class AIWorker(threading.Thread):
-    """AI 요청을 한 번에 하나씩 처리. 장면(event) 요청이 흐름(flow) 요청보다 먼저."""
+    """AI 요청을 한 번에 하나씩 처리.
+    - 해설 반응(react)이 가장 먼저. AI가 바쁜 사이 해설이 여러 줄 오면 따로따로 묻지 않고 합쳐서 한 번에 물음.
+    - 채팅은 AI가 한 줄 완성할 때마다 바로 보냄 (다 만들 때까지 기다리지 않음)."""
 
     def __init__(self, ai: LocalAI, bus: queue.Queue):
         super().__init__(daemon=True, name="ai")
@@ -997,38 +1048,89 @@ class AIWorker(threading.Thread):
         self.jobs: queue.PriorityQueue = queue.PriorityQueue()
         self.seq = 0
         self.busy = False
+        self.react_slot: dict | None = None
+        self.slot_lock = threading.Lock()
 
     def submit(self, prio: int, job: dict):
-        if prio > 0 and (self.busy or not self.jobs.empty()):
+        if prio > 0 and (self.busy or not self.jobs.empty() or self.react_slot):
             return  # 흐름·잡담 요청은 밀려 있으면 버림
         self.seq += 1
         self.jobs.put((prio, self.seq, job))
 
+    def submit_react(self, text: str, build):
+        with self.slot_lock:
+            if self.react_slot:
+                self.react_slot["texts"] = (self.react_slot["texts"] + [text])[-3:]
+                self.react_slot["t"] = time.time()
+            else:
+                self.react_slot = {"type": "react", "texts": [text], "t": time.time(), "build": build}
+
     def run(self):
         while True:
-            _, _, job = self.jobs.get()
+            with self.slot_lock:
+                job, self.react_slot = self.react_slot, None
+            if job is None:
+                try:
+                    _, _, job = self.jobs.get(timeout=0.15)
+                except queue.Empty:
+                    continue
             self.busy = True
             try:
-                if job["type"] == "identify":
-                    res = self.ai.identify(job["image"])
-                    self.bus.put(("teams_ai", res))
-                elif job["type"] == "react":
-                    if time.time() - job["t"] > 12:   # 밀려서 한참 지난 해설은 건너뜀 (지금 해설부터)
-                        continue
-                    res = self.ai.react(job["prompt"])
-                    self.bus.put(("ai_react", {"job": job, "res": res}))
-                elif job["type"] == "review":
-                    res = self.ai.review(job["prompt"])
-                    self.bus.put(("ai_review", {"job": job, "res": res}))
-                else:
-                    res = self.ai.chats(job["prompt"])
-                    self.bus.put(("ai_chats", {"job": job, "res": res}))
+                self.do(job)
             except Exception as e:
                 log.warning("ai job failed: %s", e)
                 self.bus.put(("ai_failed", job))
             finally:
                 self.busy = False
 
+    def _emit_chats(self, seg: str, done: int, kind: str, job: dict) -> int:
+        objs = re.findall(r"\{[^{}]*\}", seg)
+        for o in objs[done:]:
+            try:
+                self.bus.put((kind, {"job": job, "chat": json.loads(o)}))
+            except Exception:
+                pass
+        return len(objs)
+
+    def do(self, job):
+        kind = job["type"]
+        if kind == "identify":
+            self.bus.put(("teams_ai", self.ai.identify(job["image"])))
+        elif kind == "review":
+            self.bus.put(("ai_review", {"job": job, "res": self.ai.review(job["prompt"])}))
+        elif kind == "react":
+            if time.time() - job["t"] > 12:      # 한참 지난 해설은 건너뜀 (지금 해설부터)
+                return
+            job["text"] = " / ".join(job["texts"])
+            st = {"head": False, "n": 0}
+
+            def on_text(buf):
+                i = buf.find('"chats"')
+                if i < 0:
+                    return
+                if not st["head"]:
+                    st["head"] = True
+                    self.bus.put(("ai_react_head", {"job": job, "head": parse_head(buf[:i])}))
+                st["n"] = self._emit_chats(buf[i:], st["n"], "ai_react_chat", job)
+
+            res = self.ai.react(job["build"](job["texts"]), on_text)
+            if not st["head"]:                    # 스트리밍이 안 됐으면 끝난 답으로
+                self.bus.put(("ai_react_head", {"job": job, "head": res}))
+                for c in res.get("chats", []):
+                    self.bus.put(("ai_react_chat", {"job": job, "chat": c}))
+        elif job.get("idle"):
+            self.bus.put(("ai_chats", {"job": job, "res": self.ai.chats(job["prompt"])}))
+        else:
+            st = {"n": 0}
+
+            def on_text(buf):
+                i = buf.find('"chats"')
+                if i >= 0:
+                    st["n"] = self._emit_chats(buf[i:], st["n"], "ai_chat_part", job)
+
+            res = self.ai.chats(job["prompt"], on_text)
+            if st["n"] == 0:
+                self.bus.put(("ai_chats", {"job": job, "res": res}))
 
 # ---------------------------------------------------------------------------
 # 게임 소리 받아쓰기 (WASAPI 루프백 + faster-whisper)
@@ -1916,7 +2018,8 @@ class ChatWindow:
         # 같은 문장이 연달아 나오면 건너뜀 (진짜 채팅처럼)
         if m["kind"] in ("normal", "member", "mod"):
             recent = getattr(self, "_recent", [])
-            if m["text"] in recent:
+            # 골 직후 짧은 외침("골!!!!")은 여러 사람이 똑같이 도배하는 게 자연스러움
+            if m["text"] in recent and not (len(m["text"]) <= 8 and self.app.cur_hype() > 1.5):
                 return
             self._recent = (recent + [m["text"]])[-25:]
         t = self.text
@@ -2546,6 +2649,8 @@ class App:
         self.session_on = False
         self.live = False                  # 킥오프 버튼을 눌렀는지 (눌러야 채팅이 나옴)
         self.kickoff_at = 0.0
+        self.phase = "pre"                 # pre(킥오프 전) / play / half(하프타임) / ended
+        self.last_react_at = 0.0
         self.demo_fed = False
         self.stt: AudioSTT | None = None
         self.board: BoardWatcher | None = None
@@ -2681,6 +2786,7 @@ class App:
             return
         self.live = True
         self.kickoff_at = time.time()
+        self.phase = "play"
         log.info("kickoff pressed")
         self.chat.show_kickoff(False)
         # 새 경기: 지난 채팅과 선수 기록은 자동으로 지움
@@ -2703,6 +2809,7 @@ class App:
         if not self.live:
             return
         log.info("chat paused: %s", reason)
+        self.phase = "pre"
         self.live = False
         self.queue.clear()
         self.chat.show_kickoff(True)
@@ -2795,6 +2902,13 @@ class App:
         """1초에 나오는 채팅 수. 시청자 1천 명 ≈ 0.3개, 3만 명 ≈ 1개, 30만 명 ≈ 2.2개, 100만 명 ≈ 3.3개."""
         base = 0.3 * (max(200, self.viewers) / 1000) ** 0.35
         mult = SPEED_MULT.get(self.cfg.get("speed", "normal"), 1.0)
+        # 경기 흐름: 하프타임·경기 뒤엔 뜸하고, 후반 막판엔 빨라짐
+        if self.phase == "half":
+            mult *= 0.55
+        elif self.phase == "ended":
+            mult *= 0.6
+        elif (self.match.minute or 0) >= 80:
+            mult *= 1.25
         return max(0.1, min(12.0, base * mult * (1 + self.cur_hype())))
 
     def emit(self, m: dict):
@@ -2807,6 +2921,13 @@ class App:
         self.queue.sort(key=lambda q: q[0])
 
     def next_idle(self) -> dict:
+        # 가끔 후원·새 멤버 (시청자가 많을수록 조금 더 자주)
+        p = min(0.02, 0.003 * (max(1000, self.viewers) / 100000) ** 0.5)
+        r = random.random()
+        if r < p:
+            return self.engine.random_super()
+        if r < p * 1.8:
+            return self.engine.new_member()
         if self.idle_pool and random.random() < 0.45:
             side, text = self.idle_pool.pop(random.randrange(len(self.idle_pool)))
             if len(self.idle_pool) < 6:
@@ -2865,8 +2986,12 @@ class App:
                 self.teams_changed()
         elif kind == "ai_chats":
             self.on_ai_chats(data)
-        elif kind == "ai_react":
-            self.on_ai_react(data)
+        elif kind == "ai_react_head":
+            self.on_ai_react_head(data)
+        elif kind == "ai_react_chat":
+            self.on_ai_react_chat(data)
+        elif kind == "ai_chat_part":
+            self.on_ai_chat_part(data)
         elif kind == "ai_review":
             self.on_ai_review(data)
         elif kind == "obs":
@@ -2907,14 +3032,17 @@ class App:
         if not self.live:          # 킥오프 전에는 팀 찾기만 하고 채팅 반응은 안 함
             return
         if self.ai_ready():        # 어떤 장면인지, 어떻게 반응할지는 전부 AI가 판단
-            self.ai_react(text)
+            self.aiw.submit_react(text, self.react_prompt)
 
-    def ai_react(self, text):
+    def react_prompt(self, texts: list[str]) -> str:
+        """AI 스레드에서 부름. 밀려서 합쳐진 해설은 마지막 것이 '방금 해설'."""
+        text = texts[-1]
+        before = (f"(그 직전 해설: {' / '.join(texts[:-1])})\n" if len(texts) > 1 else "")
         events = "\n".join(f"- {k}: {v}" for k, v in EVENTS.items())
-        prompt = (
+        return (
             "너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 방금 들어온 해설 한 문장을 보고 "
             "(1) 어떤 장면인지 판단하고 (2) 그 장면에 시청자들이 바로 반응하는 채팅을 만들어.\n\n"
-            f"{self.context()}\n\n방금 해설: {text}\n\n"
+            f"{self.context()}\n\n{before}방금 해설: {text}\n\n"
             f"event 고르기:\n{events}\n"
             "- 해설은 음성 받아쓰기라 오타가 있을 수 있음. 앞뒤 해설 흐름을 같이 보고 판단할 것.\n"
             "- '골'이라는 말이 있어도 기회·아쉬움·골대·골키퍼 이야기면 goal이 아님. 확실할 때만 goal.\n"
@@ -2922,8 +3050,8 @@ class App:
             "- player: 해설에 나온 주인공 선수 이름 (명단에 있으면 명단 이름 그대로). 없으면 빈 문자열. "
             "교체면 player=나가는 선수, player_in=들어오는 선수.\n"
             "- 채팅 개수: none이면 0~2개, 보통 장면 2~4개, goal·penalty·red·end는 8~12개.\n\n"
-            f"{RULES}\n- super(후원)는 goal·penalty·red·end일 때만 1개 이하.")
-        self.aiw.submit(0, {"type": "react", "text": text, "t": time.time(), "prompt": prompt})
+            f"{RULES}\n- super(후원)는 goal·penalty·red·end일 때만 1개 이하.\n"
+            "- 채팅은 가장 먼저 튀어나올 짧은 반응(외침)부터 순서대로.")
 
     def ai_msgs(self, res) -> tuple[list[dict], list[tuple[str, str]]]:
         """AI 채팅 → 화면용 메시지. 이름·멤버 표시는 고정된 시청자 무리에서 (같은 사람이 계속 나오게)"""
@@ -2966,33 +3094,30 @@ class App:
         m.mark(key, name, what)
         m.marks[team][name]["_card_at"] = time.time()
 
-    def on_ai_react(self, data):
-        job, res = data["job"], data["res"]
+    def on_ai_react_head(self, data):
+        """AI가 해설 장면을 판단함 (채팅은 뒤이어 한 줄씩 ai_react_chat으로 옴)"""
+        job, res = data["job"], data["head"]
         m = self.match
         ev = res.get("event") if res.get("event") in EVENTS else "none"
         team = res.get("team") if res.get("team") in ("home", "away") else None
-        msgs, _ = self.ai_msgs(res)
-        late = time.time() - job["t"] > 15         # 장면이 한참 지났으면 채팅은 버림 (기록은 반영)
-        log.info("ai react: %s team=%s player=%s chats=%d%s", ev, team, res.get("player"), len(msgs), " (late)" if late else "")
-        if late:
-            msgs = []
+        wait = time.time() - job["t"]
+        self.last_react_at = time.time()
+        log.info("ai react %.1fs: %s team=%s player=%s | %s", wait, ev, team, res.get("player"), job.get("text", ""))
+        job["limit"] = 0 if wait > 15 else 14      # 장면이 한참 지났으면 채팅은 버림 (기록은 반영)
         key, player = self.resolve_player(res.get("player"), team)
         team = team or key
         if ev == "goal":
             if not self.cooldown_ok("goal"):         # 같은 골을 해설이 또 말함
-                self.enqueue(msgs[:4], 0.2, 3.0)
+                job["limit"] = min(job["limit"], 4)
                 return
+            self.add_hype(HYPE["goal"])
             if self.board_stable is not None:        # 점수는 스코어보드가 셈. 득점자만 기억해 둠
                 self.pending_scorer = (team, player, time.time())
-                self.add_hype(HYPE["goal"])
                 bg = self.last_board_goal
                 if bg and time.time() - bg[1] < 25 and player and (team in (None, bg[0])):
                     self.mark_scorer(bg[0], player)
-                self.enqueue(msgs, 0.2, 4.0)
             elif team:
-                self.goal(team, ai_msgs=msgs, scorer=player)
-            else:
-                self.enqueue(msgs, 0.2, 4.0)
+                self.goal(team, scorer=player, ai_live=True)
             return
         if ev in ("yellow", "red") and key and player:
             self.mark_card(key, player, ev)
@@ -3004,20 +3129,36 @@ class App:
                     m.mark(k2, p2, "on" if m.is_bench(k2, p2) else "off")
             self.refresh_overlay()
         if ev in COOLDOWN and not self.cooldown_ok(ev):
-            self.enqueue(msgs[:2], 0.2, 3.0)
+            job["limit"] = min(job["limit"], 2)
             return
         if ev != "none":
             m.push_event(EV_DESC[ev] + (f" ({player})" if player else ""))
             self.add_hype(HYPE.get(ev, 0.3))
         if ev in BIG:
             self.bump_viewers()
-        if ev == "end":
+        if ev == "half":
+            self.phase = "half"
+        elif ev == "kickoff":
+            self.phase = "play"
+        elif ev == "end":
+            self.phase = "ended"
             ko = self.kickoff_at
             # 2분 뒤 킥오프 전으로 (그 사이 새 경기 킥오프를 눌렀으면 건드리지 않음)
             self.root.after(120000, lambda: self.kickoff_at == ko and self.pause_chat("경기 종료"))
         if ev in ("kickoff", "half"):
             self.request_idle_pool()
-        self.enqueue(msgs, 0.2, 3.5)
+
+    def on_ai_react_chat(self, data):
+        job = data["job"]
+        if job.get("n", 0) >= job.get("limit", 14):
+            return
+        job["n"] = job.get("n", 0) + 1
+        msgs, _ = self.ai_msgs({"chats": [data["chat"]]})
+        self.enqueue(msgs, 0.1, 1.2)      # AI가 한 줄 만들 때마다 바로
+
+    def on_ai_chat_part(self, data):
+        msgs, _ = self.ai_msgs({"chats": [data["chat"]]})
+        self.enqueue(msgs, 0.1, 1.5)
 
     def mark_scorer(self, side, name):
         m = self.match
@@ -3028,7 +3169,7 @@ class App:
             m.mark(side, name, "on")
         self.refresh_overlay()
 
-    def goal(self, side, text="", ai_msgs=None, scorer=None):
+    def goal(self, side, text="", ai_msgs=None, scorer=None, ai_live=False):
         """점수 올리기. 스코어보드가 점수 변화를 봤을 때, 또는 스코어보드가 없을 때 AI가 골이라고 했을 때."""
         m = self.match
         if side == "home":
@@ -3048,7 +3189,9 @@ class App:
         self.bump_viewers()
         self.add_hype(3.0)
         self.update_state_line()
-        if ai_msgs:
+        if ai_live:                                       # AI 채팅이 한 줄씩 오고 있음
+            self.enqueue(self.engine.goal(side, 4), 0.1, 3.0)
+        elif ai_msgs:
             self.enqueue(self.engine.goal(side, 4) + ai_msgs)
         elif ps and time.time() - ps[2] < 30:
             self.enqueue(self.engine.goal(side, 5))      # AI 반응은 이미 나갔으니 조금만
@@ -3063,6 +3206,8 @@ class App:
         if d.get("minute") is not None:
             if m.minute is not None and m.minute >= 60 and d["minute"] <= 3:
                 self.pause_chat("경기 시간이 처음으로 돌아감 (새 경기)")
+            if self.phase == "half" and d["minute"] >= 46:      # 후반 시계가 돌기 시작
+                self.phase = "play"
             m.minute = d["minute"]
         if "codes" not in d:
             return
@@ -3143,11 +3288,10 @@ class App:
         self.aiw.submit(1, {"type": "chat", "prompt": prompt, "idle": True})
 
     def tick_flow(self):
-        n = len(self.match.commentary)
-        if (self.session_on and self.live and n > self.last_ai_comment_n and time.time() - self.last_ai_flow > self.cfg.get("ai_interval_sec", 20)
-                and self.ai_ready()):
+        # 해설 반응이 한동안 없을 때(조용한 구간)만 AI가 경기 흐름 잡담을 만듦
+        quiet = time.time() - self.last_react_at > 15
+        if (self.session_on and self.live and quiet and time.time() - self.last_ai_flow > 18 and self.ai_ready()):
             self.last_ai_flow = time.time()
-            self.last_ai_comment_n = n
             k = random.randint(5, 7)
             prompt = (f"너는 한국 축구 게임(FC 26) 방송의 유튜브 라이브 채팅 생성기야. 방금까지의 해설 흐름을 보고 시청자들이 쓸 법한 채팅 {k}개를 만들어. "
                       f"큰 사건이 없으면 경기 흐름, 선수, 해설이 한 말에 대한 가벼운 반응과 팬끼리의 신경전 위주로.\n\n"
@@ -3226,8 +3370,20 @@ class App:
     # ----- 주기 작업 -----
     def tick_viewers(self):
         if self.session_on:
+            # 시청자 흐름: 경기가 진행될수록 조금씩 늘고, 하프타임엔 빠졌다 돌아오고, 끝나면 서서히 나감.
+            # 골 같은 장면에서 확 늘었다가(bump_viewers) 1분쯤에 걸쳐 제자리로.
             floor = self.match.viewer_floor()
-            self.viewers = max(floor, int(self.viewers + (random.random() - 0.52) * self.viewers * 0.01))
+            mnt = self.match.minute or 0
+            if not self.live:
+                target = floor * 0.85
+            elif self.phase == "half":
+                target = floor * 0.88
+            elif self.phase == "ended":
+                target = max(floor * 0.3, self.viewers * 0.95)
+            else:
+                target = floor * (1.0 + 0.18 * min(1.0, mnt / 90))
+            self.viewers = max(100, int(self.viewers + (target - self.viewers) * 0.06
+                                        + (random.random() - 0.5) * self.viewers * 0.006))
             self.chat.set_viewers(self.viewers)
         self.root.after(4000, self.tick_viewers)
 
