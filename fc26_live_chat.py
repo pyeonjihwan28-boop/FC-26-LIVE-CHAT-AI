@@ -125,7 +125,8 @@ DEFAULT_CFG = {
     "review_interval_sec": 120,
     "whisper_model": "auto",          # auto / tiny / base / small / medium / large-v3-turbo
     "whisper_device": "auto",         # auto = 그래픽카드가 되면 그래픽카드, cpu = 항상 CPU
-    "language": "ko",                 # ko = 한국어 해설, en = 영어 해설
+    "language": "ko",                 # (예전 설정, 지금은 commentary_language를 씀)
+    "commentary_language": "ko",      # 해설 언어 (FC 26 한국어 해설). auto = 알아서 찾기
     "neutral_pct": 33,
     "speed": "normal",
     "font_scale": 1.0,
@@ -385,9 +386,19 @@ def split_josa(word: str) -> tuple[str, str]:
     return word, ""
 
 
+def edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
 def fix_names(text: str, vocab: list[str]) -> str:
-    """받아쓰기 결과에서 명단에 있는 이름과 비슷한 단어를 그 이름으로 바꿈 (예: 세스코 → 세슈코)"""
-    from difflib import SequenceMatcher
+    """받아쓰기 결과에서 명단에 있는 이름과 거의 같은 단어를 그 이름으로 바꿈 (예: 세스코 → 세슈코).
+    자모(ㄱ,ㅏ…)가 짧은 이름은 1개, 긴 이름은 2개까지만 달라야 하고, 첫 소리는 같아야 함."""
     cands = {}
     for v in vocab:
         for part in [v, *v.split()]:
@@ -404,19 +415,20 @@ def fix_names(text: str, vocab: list[str]) -> str:
             continue
         word, rest = m.group(1), m.group(2)
         core, suf = split_josa(word)
-        if core in cands or word in cands or core in COMMON_WORDS or len(core) < 2:
+        # 두 글자 단어는 흔한 말과 헷갈리기 쉬워서(그런→그린) 세 글자 이상만 고침
+        if core in cands or word in cands or core in COMMON_WORDS or len(core) < 3:
             out.append(tok)
             continue
         cj = jamo(core)
-        best, br = None, 0.0
+        best, bd = None, 99
         for name, nj in cands.items():
-            if abs(len(name) - len(core)) > 1:
+            if len(name) != len(core) or nj[:1] != cj[:1]:
                 continue
-            r = SequenceMatcher(None, cj, nj).ratio()
-            if r > br:
-                best, br = name, r
-        need = 0.8 if len(core) <= 2 else 0.76
-        out.append(best + suf + rest if best and br >= need else tok)
+            d = edit_distance(cj, nj)
+            if d < bd:
+                best, bd = name, d
+        allow = 1 if len(core) <= 3 else 2
+        out.append(best + suf + rest if best and bd <= allow else tok)
     return " ".join(out)
 
 
@@ -1029,7 +1041,8 @@ class AIWorker(threading.Thread):
 # ---------------------------------------------------------------------------
 # 게임 소리 받아쓰기 (WASAPI 루프백 + faster-whisper)
 # ---------------------------------------------------------------------------
-HALLUCINATION = ["시청해 주셔서", "시청해주셔서", "구독과 좋아요", "구독 좋아요", "좋아요와 구독", "자막 제공", "자막by", "자막 by",
+HALLUCINATION = ["시청해 주셔서", "감사합니다 감사합니다", "구독", "좋아요", "알림 설정", "다음 시간에", "오늘 영상", "영상이었습니다",
+                 "제작 지원", "후원", "MBC", "KBS", "SBS", "JTBC", "기자입니다", "뉴스입니다", "이 영상은", "시청해주셔서", "구독과 좋아요", "구독 좋아요", "좋아요와 구독", "자막 제공", "자막by", "자막 by",
                  "mbc 뉴스", "kbs 뉴스", "sbs 뉴스", "다음 영상에서", "영상 끝까지", "한글자막", "배달의민족", "ytn"]
 ONLY_FILLER = re.compile(r"^(감사합니다|고맙습니다|네|아|음|어|예|네네|안녕하세요)[.!?~ ]*$")
 SR = 16000
@@ -1060,6 +1073,8 @@ def to_16k(a, rate: int):
     return np.interp(np.linspace(0, len(a), n, endpoint=False), np.arange(len(a)), a).astype(np.float32)
 
 
+LANG_NAMES = {"ko": "한국어", "en": "영어", "es": "스페인어", "fr": "프랑스어", "de": "독일어", "it": "이탈리아어",
+              "pt": "포르투갈어", "ja": "일본어", "zh": "중국어", "nl": "네덜란드어", "ar": "아랍어", "pl": "폴란드어", "tr": "튀르키예어"}
 CUDA_ERR = re.compile(r"(cublas|cudnn|cuda|cudart|nvrtc|curand)", re.I)
 
 
@@ -1097,8 +1112,10 @@ class AudioSTT(threading.Thread):
         self.stop_flag = threading.Event()
         self.chunks: list[bytes] = []
         self.lock = threading.Lock()
-        self.prev_text = ""
         self.no_hotwords = False
+        lang = str(self.cfg.get("commentary_language", "ko") or "ko")
+        self.lang = None if lang == "auto" else lang     # 정해진 해설 언어 (auto면 몇 번 듣고 정함)
+        self.lang_votes: list[str] = []
 
     @classmethod
     def load_model(cls, cfg, force_cpu: bool = False):
@@ -1150,7 +1167,7 @@ class AudioSTT(threading.Thread):
         """말소리 구간 찾기 (faster-whisper 안의 Silero VAD). 없으면 None."""
         try:
             from faster_whisper.vad import VadOptions, get_speech_timestamps
-            opts = VadOptions(threshold=0.45, min_speech_duration_ms=200, min_silence_duration_ms=300, speech_pad_ms=150)
+            opts = VadOptions(threshold=0.6, min_speech_duration_ms=300, min_silence_duration_ms=300, speech_pad_ms=150)
             import numpy as np
             get_speech_timestamps(np.zeros(SR, dtype=np.float32), opts)   # 한 번 돌려 봄
             return lambda a: get_speech_timestamps(a, opts)
@@ -1162,26 +1179,27 @@ class AudioSTT(threading.Thread):
         import numpy as np
         model = self.model
         peak = float(np.max(np.abs(piece))) if len(piece) else 0.0
-        if peak < 0.003:
+        rms = float(np.sqrt(np.mean(piece * piece))) if len(piece) else 0.0
+        if peak < 0.01 or rms < 0.004:
             return
-        piece = (piece * min(8.0, 0.9 / peak)).astype(np.float32)    # 작은 소리는 키움
-        prompt, hot = self.prompt_fn()
-        full_prompt = f"{prompt} {self.prev_text[-80:]}".strip()
+        piece = (piece * min(3.0, 0.9 / peak)).astype(np.float32)    # 작은 소리만 조금 키움 (너무 키우면 관중 소리를 말로 착각)
+        lang = self.lang
+        # 힌트(앞 문맥·핫워드)는 한국어 해설일 때만. 다른 언어에 한국어 힌트를 주면 엉뚱하게 번역하듯 받아씀
+        prompt, hot = self.prompt_fn() if lang == "ko" else ("", "")
         beam = 5 if self._device == "cuda" else 3
-        kw = dict(language=self.cfg.get("language", "ko"), beam_size=beam, best_of=beam,
-                  vad_filter=not vad_done, condition_on_previous_text=False, initial_prompt=full_prompt,
-                  temperature=[0.0, 0.2, 0.4], no_speech_threshold=0.6, log_prob_threshold=-1.0,
+        kw = dict(language=lang, beam_size=beam, vad_filter=not vad_done, condition_on_previous_text=False,
+                  initial_prompt=prompt or None, temperature=0.0, no_speech_threshold=0.5, log_prob_threshold=-0.8,
                   compression_ratio_threshold=2.2, without_timestamps=True)
         if hot and not self.no_hotwords:
             kw["hotwords"] = hot
         try:
             try:
-                segs, _ = model.transcribe(piece, **kw)
+                segs, info = model.transcribe(piece, **kw)
                 segs = list(segs)
             except TypeError:                   # 오래된 faster-whisper에는 hotwords가 없음
                 self.no_hotwords = True
                 kw.pop("hotwords", None)
-                segs, _ = model.transcribe(piece, **kw)
+                segs, info = model.transcribe(piece, **kw)
                 segs = list(segs)
         except Exception as e:
             if self._device == "cuda" and CUDA_ERR.search(str(e)):
@@ -1192,19 +1210,33 @@ class AudioSTT(threading.Thread):
                 self.bus.put(("stt_status", ("on", "해설 듣는 중 (CPU)")))
                 return
             raise
+        if lang is None:
+            self.vote_language(info)
         parts = []
         for s in segs:
-            if s.avg_logprob < -1.1:
+            if s.avg_logprob < -0.8:            # 자신 없는 받아쓰기는 버림
                 continue
-            if s.no_speech_prob > 0.55 and s.avg_logprob < -0.6:
+            if s.no_speech_prob > 0.45:         # 말소리가 아닐 가능성이 크면 버림
                 continue
             if getattr(s, "compression_ratio", 1.0) > 2.4:
                 continue
             parts.append(s.text.strip())
-        text = clean_transcript(" ".join(parts), full_prompt)
+        text = clean_transcript(" ".join(parts), prompt)
         if text:
-            self.prev_text = text
+            log.info("stt[%s]: %s", lang or getattr(info, "language", "?"), text)
             self.bus.put(("text", text))
+
+    def vote_language(self, info):
+        """해설 언어 자동 찾기: 확신 있는 결과가 3번 연속 같으면 그 언어로 고정"""
+        code = getattr(info, "language", None)
+        prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+        if not code or prob < 0.7:
+            return
+        self.lang_votes = (self.lang_votes + [code])[-3:]
+        if len(self.lang_votes) == 3 and len(set(self.lang_votes)) == 1:
+            self.lang = code
+            log.info("commentary language: %s", code)
+            self.bus.put(("stt_status", ("on", f"해설 듣는 중 ({LANG_NAMES.get(code, code)})")))
 
     def run(self):
         try:
@@ -2725,8 +2757,7 @@ class App:
         names = m.lineup_names("home")[:11] + m.lineup_names("away")[:11] + m.korean_names("home") + m.korean_names("away")
         names = list(dict.fromkeys(names))
         teams = f"{m.home.label} 대 {m.away.label}" if m.home.name or m.away.name else "축구"
-        prompt = (f"{teams} 경기 중계입니다. " + (f"출전 선수는 {', '.join(names)}. " if names else "")
-                  + "슈팅, 골, 선방, 코너킥, 프리킥, 페널티킥, 오프사이드, 경고, 퇴장, 교체.")
+        prompt = f"{teams} 경기 중계입니다."
         hot = " ".join([m.home.name, m.away.name, *names]).strip()
         return prompt, hot
 
@@ -2843,7 +2874,8 @@ class App:
 
     def on_commentary(self, text):
         m = self.match
-        text = fix_names(text, self.name_vocab())
+        if len(re.findall(r"[가-힣]", text)) >= len(text.replace(" ", "")) * 0.5:
+            text = fix_names(text, self.name_vocab())
         m.commentary.append((time.time(), text))
         m.commentary = m.commentary[-60:]
         self.chat.set_transcript(text)
